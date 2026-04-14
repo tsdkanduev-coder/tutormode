@@ -19,6 +19,7 @@ Our vision for DeepTutor's future development.
 - [ ] **Personalized Memory** — Adapt tutoring style based on user learning history
 - [ ] **Additional RAG Backends** — ChromaDB, Pinecone integration
 - [ ] **More Embedding Adapters** — Voyage AI, Mixedbread, local transformers
+- [ ] **GigaChat Retrieval Parity** — Move the current GigaChat branch from chat/tool support to full embeddings + RAG support for production evaluation
 
 ## 💭 Under Consideration
 

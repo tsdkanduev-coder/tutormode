@@ -49,3 +49,11 @@ shim layer and any edge-case response adaptation around partial tool deltas.
 For now, keep embeddings/RAG on OpenAI in this branch. Giga Cowork proves the
 Arena chat/tool loop, but it does not provide the same ready-made reference for
 DeepTutor's embedding path.
+
+## Deferred follow-up
+
+The next planned step for this branch is Giga-native retrieval parity:
+
+- wire embeddings to the official Giga embeddings endpoint
+- disable OpenAI-specific embedding request fields that Giga does not expect
+- validate end-to-end RAG quality before considering this branch deployable
