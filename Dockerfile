@@ -468,3 +468,11 @@ RUN sed -i 's/\r$//' /etc/supervisor/conf.d/deeptutor.conf
 
 # Development ports
 EXPOSE 8001 3782
+
+# ============================================
+# Stage 5: Final Production Image (Default)
+# ============================================
+# Keep the production runtime as the last stage so platforms like Render,
+# which build the final Docker stage by default, do not accidentally deploy
+# the hot-reload development image.
+FROM production AS final
