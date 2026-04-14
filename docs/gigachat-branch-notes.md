@@ -34,10 +34,15 @@ Giga Cowork does more than auth. It also adapts tool calling:
 - tool state is carried with `tool_state_id` / `functions_state_id`
 - responses are converted back into the caller's internal format
 
-That transport/message shim is the next slice to port if we want full
-TutorBot tool support on GigaChat. The current branch only lays down the
-auth + provider wiring foundation for chat paths that can already speak
-OpenAI-style requests.
+This branch now includes:
+
+- auth + token exchange
+- Arena request building for normal chat
+- TutorBot-side tool request/result serialization with `tool_state_id`
+  and `functions_state_id`
+
+What still remains for full parity with Giga Cowork is the richer streaming
+shim layer and any edge-case response adaptation around partial tool deltas.
 
 ## Practical implication
 

@@ -10,10 +10,7 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from deeptutor.logging import get_logger
-from deeptutor.services.gigachat_auth import (
-    normalize_gigachat_base_url,
-    resolve_gigachat_access_token,
-)
+from deeptutor.services.gigachat_transport import complete_gigachat, stream_gigachat_text
 from deeptutor.services.llm.provider_registry import find_by_name, strip_provider_prefix
 
 from .config import get_token_limit_kwargs
@@ -89,12 +86,20 @@ async def sdk_complete(
     if extra_headers:
         default_headers.update(extra_headers)
     if provider_name == "gigachat":
-        effective_base = normalize_gigachat_base_url(effective_base)
-        effective_key = await resolve_gigachat_access_token(
-            base_url=effective_base,
+        result = await complete_gigachat(
+            messages=_build_messages(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                messages=messages,
+            ),
+            model=resolved_model,
             api_key=effective_key,
-            default_headers=default_headers,
+            base_url=effective_base,
+            max_tokens=max_tokens_val,
+            temperature=temperature_val,
+            extra_headers=default_headers,
         )
+        return result.content or ""
 
     client = AsyncOpenAI(
         api_key=effective_key or "no-key",
@@ -157,12 +162,21 @@ async def sdk_stream(
     if extra_headers:
         default_headers.update(extra_headers)
     if provider_name == "gigachat":
-        effective_base = normalize_gigachat_base_url(effective_base)
-        effective_key = await resolve_gigachat_access_token(
-            base_url=effective_base,
+        async for text in stream_gigachat_text(
+            messages=_build_messages(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                messages=messages,
+            ),
+            model=resolved_model,
             api_key=effective_key,
-            default_headers=default_headers,
-        )
+            base_url=effective_base,
+            max_tokens=max_tokens_val,
+            temperature=temperature_val,
+            extra_headers=default_headers,
+        ):
+            yield text
+        return
 
     client = AsyncOpenAI(
         api_key=effective_key or "no-key",

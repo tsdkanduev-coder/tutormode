@@ -17,10 +17,7 @@ from typing import TYPE_CHECKING, Any
 import json_repair
 from openai import AsyncOpenAI
 
-from deeptutor.services.gigachat_auth import (
-    normalize_gigachat_base_url,
-    resolve_gigachat_access_token_sync,
-)
+from deeptutor.services.gigachat_transport import complete_gigachat
 from deeptutor.tutorbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 if TYPE_CHECKING:
@@ -99,14 +96,6 @@ class OpenAICompatProvider(LLMProvider):
             default_headers.update(_DEFAULT_OPENROUTER_HEADERS)
         if extra_headers:
             default_headers.update(extra_headers)
-        if spec and spec.name == "gigachat":
-            effective_base = normalize_gigachat_base_url(effective_base)
-            api_key = resolve_gigachat_access_token_sync(
-                base_url=effective_base,
-                api_key=api_key,
-                default_headers=default_headers,
-            )
-
         self._client = AsyncOpenAI(
             api_key=api_key or "no-key",
             base_url=effective_base,
@@ -500,6 +489,40 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
+        if self._spec and self._spec.name == "gigachat":
+            try:
+                result = await complete_gigachat(
+                    messages=self._sanitize_messages(self._sanitize_empty_content(messages)),
+                    tools=tools,
+                    model=model or self.default_model,
+                    api_key=self.api_key,
+                    base_url=self.api_base,
+                    max_tokens=max(1, max_tokens),
+                    temperature=temperature,
+                    tool_choice=tool_choice,
+                    extra_headers=self.extra_headers,
+                )
+                return LLMResponse(
+                    content=result.content,
+                    tool_calls=[
+                        ToolCallRequest(
+                            id=tc.id,
+                            name=tc.name,
+                            arguments=tc.arguments,
+                            function_provider_specific_fields=(
+                                {"gigachat": {"tool_state_id": tc.tool_state_id}}
+                                if tc.tool_state_id
+                                else None
+                            ),
+                        )
+                        for tc in result.tool_calls
+                    ],
+                    finish_reason=result.finish_reason,
+                    usage=result.usage,
+                )
+            except Exception as e:
+                return self._handle_error(e)
+
         kwargs = self._build_kwargs(
             messages, tools, model, max_tokens, temperature,
             reasoning_effort, tool_choice,
@@ -525,6 +548,20 @@ class OpenAICompatProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
+        if self._spec and self._spec.name == "gigachat":
+            response = await self.chat(
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                tool_choice=tool_choice,
+            )
+            if on_content_delta and response.content:
+                await on_content_delta(response.content)
+            return response
+
         kwargs = self._build_kwargs(
             messages, tools, model, max_tokens, temperature,
             reasoning_effort, tool_choice,
