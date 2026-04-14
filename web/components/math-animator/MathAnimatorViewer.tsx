@@ -25,13 +25,14 @@ export default function MathAnimatorViewer({
   );
   const resolveAssetUrl = (url: string) => (url.startsWith("http://") || url.startsWith("https://") ? url : apiUrl(url));
 
-  const handleWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
+  const handleWheel = useCallback((event: React.WheelEvent<HTMLElement>) => {
     forwardWheelToChatScrollRoot(event, rootRef.current);
   }, []);
 
   return (
     <div
       ref={rootRef}
+      onWheelCapture={handleWheel}
       onWheel={handleWheel}
       className="mb-3 space-y-3 rounded-2xl border border-[var(--border)] bg-[var(--card)]/70 p-3"
     >
@@ -39,11 +40,13 @@ export default function MathAnimatorViewer({
         <section className="space-y-2">
           <Header icon={Video} title={t("Video Output")} />
           {videos.map((item) => (
-            <div key={item.url}>
+            <div key={item.url} onWheelCapture={handleWheel} onWheel={handleWheel}>
               <video
                 controls
                 playsInline
                 preload="metadata"
+                onWheelCapture={handleWheel}
+                onWheel={handleWheel}
                 className="aspect-video w-full rounded-xl border border-[var(--border)] bg-black object-contain"
                 src={resolveAssetUrl(item.url)}
               />
@@ -79,12 +82,20 @@ export default function MathAnimatorViewer({
       ) : null}
 
       {result.code.content ? (
-        <details className="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--background)]">
+        <details
+          onWheelCapture={handleWheel}
+          onWheel={handleWheel}
+          className="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--background)]"
+        >
           <summary className="flex cursor-pointer items-center gap-2 px-3 py-2 text-[12px] font-medium text-[var(--foreground)]">
             <Code2 size={14} />
             {t("View Manim Code")}
           </summary>
-          <pre className="max-h-[360px] overflow-auto border-t border-[var(--border)] px-3 py-3 font-mono text-[11px] leading-[1.6] text-[var(--foreground)]">
+          <pre
+            onWheelCapture={handleWheel}
+            onWheel={handleWheel}
+            className="max-h-[360px] overflow-auto border-t border-[var(--border)] px-3 py-3 font-mono text-[11px] leading-[1.6] text-[var(--foreground)]"
+          >
             {result.code.content}
           </pre>
         </details>

@@ -14,6 +14,7 @@ const NestedScrollArea = forwardRef<HTMLDivElement, NestedScrollAreaProps>(funct
   {
     children,
     onWheel,
+    onWheelCapture,
     ...props
   },
   forwardedRef,
@@ -42,10 +43,22 @@ const NestedScrollArea = forwardRef<HTMLDivElement, NestedScrollAreaProps>(funct
     [onWheel],
   );
 
+  const handleWheelCapture = useCallback(
+    (event: React.WheelEvent<HTMLDivElement>) => {
+      if (onWheelCapture) {
+        onWheelCapture(event);
+      }
+      if (event.defaultPrevented) return;
+      forwardWheelToChatScrollRoot(event, ref.current);
+    },
+    [onWheelCapture],
+  );
+
   return (
     <div
       {...props}
       ref={setRef}
+      onWheelCapture={handleWheelCapture}
       onWheel={handleWheel}
     >
       {children}
