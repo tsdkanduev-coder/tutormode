@@ -86,6 +86,11 @@ def get_pipeline(name: str = DEFAULT_PROVIDER, kb_base_dir: Optional[str] = None
         ) from e
 
 
+def reset_pipeline_cache() -> None:
+    """Drop cached pipeline instances so runtime config changes take effect immediately."""
+    _PIPELINE_CACHE.clear()
+
+
 def list_pipelines() -> List[Dict[str, str]]:
     """List available pipelines."""
     return [

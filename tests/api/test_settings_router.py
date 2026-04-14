@@ -14,6 +14,7 @@ from deeptutor.services.embedding import client as embedding_client_module
 from deeptutor.services.embedding import config as embedding_config_module
 from deeptutor.services.llm import client as llm_client_module
 from deeptutor.services.llm import config as llm_config_module
+from deeptutor.services.rag import factory as rag_factory_module
 
 
 class _DummyLogger:
@@ -201,10 +202,12 @@ def _reset_runtime_state() -> None:
     llm_config_module.clear_llm_config_cache()
     llm_client_module.reset_llm_client()
     embedding_client_module.reset_embedding_client()
+    rag_factory_module.reset_pipeline_cache()
     yield
     llm_config_module.clear_llm_config_cache()
     llm_client_module.reset_llm_client()
     embedding_client_module.reset_embedding_client()
+    rag_factory_module.reset_pipeline_cache()
 
 
 @pytest.mark.asyncio
@@ -231,6 +234,8 @@ async def test_update_catalog_invalidates_runtime_caches(monkeypatch: pytest.Mon
     old_llm_config = llm_config_module.get_llm_config()
     old_llm_client = llm_client_module.get_llm_client()
     old_embedding_client = embedding_client_module.get_embedding_client()
+    old_pipeline = object()
+    monkeypatch.setitem(rag_factory_module._PIPELINE_CACHE, ("llamaindex", None), old_pipeline)
 
     response = await settings_router.update_catalog(
         settings_router.CatalogPayload(catalog=updated_catalog)
@@ -250,6 +255,7 @@ async def test_update_catalog_invalidates_runtime_caches(monkeypatch: pytest.Mon
     assert new_embedding_client is not old_embedding_client
     assert new_embedding_client.config.model == "text-embedding-new"
     assert new_embedding_client.config.base_url == "https://new-embedding.example/v1"
+    assert rag_factory_module._PIPELINE_CACHE == {}
 
 
 @pytest.mark.asyncio
@@ -276,6 +282,8 @@ async def test_apply_catalog_invalidates_runtime_caches(monkeypatch: pytest.Monk
     llm_config_module.get_llm_config()
     old_llm_client = llm_client_module.get_llm_client()
     old_embedding_client = embedding_client_module.get_embedding_client()
+    old_pipeline = object()
+    monkeypatch.setitem(rag_factory_module._PIPELINE_CACHE, ("llamaindex", None), old_pipeline)
 
     response = await settings_router.apply_catalog(
         settings_router.CatalogPayload(catalog=applied_catalog)
@@ -293,6 +301,7 @@ async def test_apply_catalog_invalidates_runtime_caches(monkeypatch: pytest.Monk
     assert new_llm_client.config.base_url == "https://after-apply-llm.example/v1"
     assert new_embedding_client is not old_embedding_client
     assert new_embedding_client.config.model == "text-embedding-after-apply"
+    assert rag_factory_module._PIPELINE_CACHE == {}
 
 
 @pytest.mark.asyncio

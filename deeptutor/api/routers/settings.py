@@ -21,6 +21,7 @@ from deeptutor.services.embedding.client import reset_embedding_client
 from deeptutor.services.llm.client import reset_llm_client
 from deeptutor.services.llm.config import clear_llm_config_cache
 from deeptutor.services.path_service import get_path_service
+from deeptutor.services.rag.factory import reset_pipeline_cache
 
 router = APIRouter()
 
@@ -77,6 +78,7 @@ def _invalidate_runtime_caches() -> None:
     clear_llm_config_cache()
     reset_llm_client()
     reset_embedding_client()
+    reset_pipeline_cache()
 
 
 def load_ui_settings() -> dict[str, Any]:
