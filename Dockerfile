@@ -214,12 +214,12 @@ set -e
 
 BACKEND_PORT=${BACKEND_PORT:-8001}
 
-echo "[Backend]  🚀 Starting FastAPI backend on port ${BACKEND_PORT}..."
+echo "[Backend]  🚀 Starting FastAPI backend on 127.0.0.1:${BACKEND_PORT}..."
 
 # Run uvicorn directly - the application's logging system already handles:
 # 1. Console output (visible in docker logs)
 # 2. File logging to data/user/logs/ai_tutor_*.log
-exec python -m uvicorn deeptutor.api.main:app --host 0.0.0.0 --port ${BACKEND_PORT}
+exec python -m uvicorn deeptutor.api.main:app --host 127.0.0.1 --port ${BACKEND_PORT}
 EOF
 
 RUN sed -i 's/\r$//' /app/start-backend.sh && chmod +x /app/start-backend.sh
@@ -264,10 +264,10 @@ echo "[Frontend] 🚀 Starting Next.js frontend on port ${FRONTEND_PORT}..."
 find /app/web/.next -type f \( -name "*.js" -o -name "*.json" \) -exec \
     sed -i "s|__NEXT_PUBLIC_API_BASE_PLACEHOLDER__|${API_BASE}|g" {} \; 2>/dev/null || true
 
-# Start Next.js standalone server
-# The standalone server reads PORT and HOSTNAME from environment variables
+# Start Next.js standalone server bound to loopback only.
+# Render should see only the nginx proxy on the public PORT.
 export PORT=${FRONTEND_PORT}
-export HOSTNAME=0.0.0.0
+export HOSTNAME=127.0.0.1
 exec node /app/web/server.js
 EOF
 
@@ -390,10 +390,9 @@ RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 # Expose ports
 EXPOSE 8001 3782 10000
 
-# Health check
+# Health check: require the public proxy path to be healthy.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -fsS "http://localhost:${PORT:-10000}/api/v1/system/status" >/dev/null || \
-        curl -fsS "http://localhost:${BACKEND_PORT:-8001}/api/v1/system/status" >/dev/null || exit 1
+    CMD curl -fsS "http://127.0.0.1:${PORT:-10000}/api/v1/system/status" >/dev/null || exit 1
 
 # Set entrypoint
 ENTRYPOINT ["/app/entrypoint.sh"]
