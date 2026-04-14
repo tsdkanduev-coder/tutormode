@@ -10,6 +10,10 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from deeptutor.logging import get_logger
+from deeptutor.services.gigachat_auth import (
+    normalize_gigachat_base_url,
+    resolve_gigachat_access_token,
+)
 from deeptutor.services.llm.provider_registry import find_by_name, strip_provider_prefix
 
 from .config import get_token_limit_kwargs
@@ -84,6 +88,13 @@ async def sdk_complete(
     default_headers: dict[str, str] = {"x-session-affinity": uuid.uuid4().hex}
     if extra_headers:
         default_headers.update(extra_headers)
+    if provider_name == "gigachat":
+        effective_base = normalize_gigachat_base_url(effective_base)
+        effective_key = await resolve_gigachat_access_token(
+            base_url=effective_base,
+            api_key=effective_key,
+            default_headers=default_headers,
+        )
 
     client = AsyncOpenAI(
         api_key=effective_key or "no-key",
@@ -145,6 +156,13 @@ async def sdk_stream(
     default_headers: dict[str, str] = {"x-session-affinity": uuid.uuid4().hex}
     if extra_headers:
         default_headers.update(extra_headers)
+    if provider_name == "gigachat":
+        effective_base = normalize_gigachat_base_url(effective_base)
+        effective_key = await resolve_gigachat_access_token(
+            base_url=effective_base,
+            api_key=effective_key,
+            default_headers=default_headers,
+        )
 
     client = AsyncOpenAI(
         api_key=effective_key or "no-key",

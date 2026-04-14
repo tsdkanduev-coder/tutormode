@@ -193,6 +193,14 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         supports_max_completion_tokens=True,
     ),
     ProviderSpec(
+        name="gigachat",
+        keywords=("gigachat", "giga", "sber"),
+        env_key="GIGACHAT_ACCESS_TOKEN",
+        display_name="GigaChat",
+        backend="openai_compat",
+        default_api_base="https://gigachat.sberdevices.ru/v2",
+    ),
+    ProviderSpec(
         name="openai_codex",
         keywords=("openai-codex",),
         env_key="",

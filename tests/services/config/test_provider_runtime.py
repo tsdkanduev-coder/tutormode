@@ -163,6 +163,25 @@ def test_llm_local_fallback(tmp_path: Path) -> None:
     assert resolved.api_key == "sk-no-key-required"
 
 
+def test_llm_gigachat_binding_uses_arena_base(tmp_path: Path) -> None:
+    catalog = _build_catalog(
+        llm_profile={
+            "id": "llm-p",
+            "name": "LLM",
+            "binding": "gigachat",
+            "base_url": "",
+            "api_key": "gigachat-token",
+            "api_version": "",
+            "extra_headers": {},
+            "models": [{"id": "llm-m", "name": "m", "model": "GigaChat-2-Max"}],
+        }
+    )
+    resolved = resolve_llm_runtime_config(catalog=catalog, env_store=_empty_env(tmp_path))
+    assert resolved.provider_name == "gigachat"
+    assert resolved.provider_mode == "standard"
+    assert resolved.effective_url == "https://gigachat.sberdevices.ru/v2"
+
+
 def test_search_fallback_to_duckduckgo_without_key(tmp_path: Path) -> None:
     catalog = _build_catalog(
         search_profile={

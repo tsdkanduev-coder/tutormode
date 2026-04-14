@@ -17,6 +17,10 @@ from typing import TYPE_CHECKING, Any
 import json_repair
 from openai import AsyncOpenAI
 
+from deeptutor.services.gigachat_auth import (
+    normalize_gigachat_base_url,
+    resolve_gigachat_access_token_sync,
+)
 from deeptutor.tutorbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 if TYPE_CHECKING:
@@ -95,6 +99,13 @@ class OpenAICompatProvider(LLMProvider):
             default_headers.update(_DEFAULT_OPENROUTER_HEADERS)
         if extra_headers:
             default_headers.update(extra_headers)
+        if spec and spec.name == "gigachat":
+            effective_base = normalize_gigachat_base_url(effective_base)
+            api_key = resolve_gigachat_access_token_sync(
+                base_url=effective_base,
+                api_key=api_key,
+                default_headers=default_headers,
+            )
 
         self._client = AsyncOpenAI(
             api_key=api_key or "no-key",

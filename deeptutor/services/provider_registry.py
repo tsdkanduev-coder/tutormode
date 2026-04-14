@@ -76,6 +76,9 @@ PROVIDER_ALIASES = {
     "byteplusCodingPlan": "byteplus_coding_plan",
     "github-copilot": "github_copilot",
     "openai-codex": "openai_codex",
+    "giga": "gigachat",
+    "sber": "gigachat",
+    "sberbank": "gigachat",
 }
 
 
@@ -205,6 +208,14 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="openai_compat",
         default_api_base="https://api.openai.com/v1",
         supports_max_completion_tokens=True,
+    ),
+    ProviderSpec(
+        name="gigachat",
+        keywords=("gigachat", "giga", "sber"),
+        env_key="GIGACHAT_ACCESS_TOKEN",
+        display_name="GigaChat",
+        backend="openai_compat",
+        default_api_base="https://gigachat.sberdevices.ru/v2",
     ),
     ProviderSpec(
         name="openai_codex",
