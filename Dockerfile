@@ -224,13 +224,14 @@ RUN cat > /app/start-backend.sh <<'EOF'
 set -e
 
 BACKEND_PORT=${BACKEND_PORT:-8001}
+BACKEND_HOST=${BACKEND_HOST:-127.0.0.1}
 
-echo "[Backend]  🚀 Starting FastAPI backend on 127.0.0.1:${BACKEND_PORT}..."
+echo "[Backend]  🚀 Starting FastAPI backend on ${BACKEND_HOST}:${BACKEND_PORT}..."
 
 # Run uvicorn directly - the application's logging system already handles:
 # 1. Console output (visible in docker logs)
 # 2. File logging to data/user/logs/ai_tutor_*.log
-exec python -m uvicorn deeptutor.api.main:app --host 127.0.0.1 --port ${BACKEND_PORT}
+exec python -m uvicorn deeptutor.api.main:app --host ${BACKEND_HOST} --port ${BACKEND_PORT}
 EOF
 
 RUN sed -i 's/\r$//' /app/start-backend.sh && chmod +x /app/start-backend.sh
@@ -352,6 +353,8 @@ RUN cat > /app/entrypoint.sh <<'EOF'
 #!/bin/bash
 set -e
 
+SERVICE_MODE=${SERVICE_MODE:-full}
+
 echo "============================================"
 echo "🚀 Starting DeepTutor"
 echo "============================================"
@@ -364,6 +367,7 @@ export PORT=${PORT:-10000}
 echo "📌 Backend Port: ${BACKEND_PORT}"
 echo "📌 Frontend Port: ${FRONTEND_PORT}"
 echo "📌 Public Port: ${PORT}"
+echo "📌 Service Mode: ${SERVICE_MODE}"
 
 # Check for required environment variables
 if [ -z "$LLM_API_KEY" ]; then
@@ -391,6 +395,13 @@ echo "   - Environment variables (.env file)"
 echo "   - data/user/settings/main.yaml"
 echo "   - data/user/settings/agents.yaml"
 echo "============================================"
+
+if [ "$SERVICE_MODE" = "backend" ]; then
+    echo "🧠 Backend-only mode enabled"
+    export BACKEND_HOST=0.0.0.0
+    export BACKEND_PORT=${PORT}
+    exec /bin/bash /app/start-backend.sh
+fi
 
 # Start supervisord
 exec /usr/bin/supervisord -c /etc/supervisor/conf.d/deeptutor.conf
