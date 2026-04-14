@@ -60,11 +60,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     build-essential \
+    cmake \
+    ffmpeg \
     libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
     libxrender1 \
+    libcairo2-dev \
+    libffi-dev \
+    libpango1.0-dev \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/* \
@@ -77,7 +82,8 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 COPY requirements/ ./requirements/
 COPY requirements.txt ./
 RUN pip install --upgrade pip && \
-    pip install -r requirements.txt
+    pip install -r requirements.txt && \
+    pip install -r requirements/math-animator.txt
 
 # ============================================
 # Stage 3: Production Image
@@ -108,8 +114,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     nginx \
     supervisor \
+    ffmpeg \
     libgl1 \
     libglib2.0-0 \
+    libcairo2 \
+    libffi8 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
     libsm6 \
     libxext6 \
     libxrender1 \

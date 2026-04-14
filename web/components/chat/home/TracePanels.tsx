@@ -12,6 +12,7 @@ import {
   Terminal,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import NestedScrollArea from "@/components/common/NestedScrollArea";
 import MarkdownRenderer from "@/components/common/MarkdownRenderer";
 import type { StreamEvent } from "@/lib/unified-ws";
 
@@ -311,9 +312,9 @@ function ScrollableTraceBody({
   }, []);
 
   return (
-    <div ref={ref} onScroll={handleScroll} className={className}>
+    <NestedScrollArea ref={ref} onScroll={handleScroll} className={className}>
       {children}
-    </div>
+    </NestedScrollArea>
   );
 }
 
@@ -464,13 +465,13 @@ function TraceRowBody({
               <div className="not-italic text-[11px] font-medium uppercase tracking-[0.08em] text-[var(--muted-foreground)]">
                 {t("Raw logs")}
               </div>
-              <div className="max-h-[200px] overflow-y-auto rounded-md border border-[var(--border)] bg-[#292524] px-3 py-2 font-mono text-[10px] leading-[1.55] text-[#D6D3D1] shadow-inner">
+              <NestedScrollArea className="max-h-[200px] overflow-y-auto rounded-md border border-[var(--border)] bg-[#292524] px-3 py-2 font-mono text-[10px] leading-[1.55] text-[#D6D3D1] shadow-inner">
                 {rawProgressEvents.map((event, idx) => (
                   <div key={`${callId}-raw-${idx}`} className="whitespace-pre-wrap break-words">
                     {event.content}
                   </div>
                 ))}
-              </div>
+              </NestedScrollArea>
             </div>
           )}
 
@@ -839,13 +840,13 @@ export function CallTracePanel({
                             </div>
                           ))}
                           {(trRole === "retrieve" || trKind === "math_render_output") && rawEvts.length > 0 && (
-                            <div className="max-h-[160px] overflow-y-auto rounded-md border border-[var(--border)] bg-[#292524] px-3 py-2 font-mono text-[10px] not-italic leading-[1.55] text-[#D6D3D1] shadow-inner">
+                            <NestedScrollArea className="max-h-[160px] overflow-y-auto rounded-md border border-[var(--border)] bg-[#292524] px-3 py-2 font-mono text-[10px] not-italic leading-[1.55] text-[#D6D3D1] shadow-inner">
                               {rawEvts.map((ev, ei) => (
                                 <div key={`${trace.callId}-rw-${ei}`} className="whitespace-pre-wrap break-words">
                                   {ev.content}
                                 </div>
                               ))}
-                            </div>
+                            </NestedScrollArea>
                           )}
                           {inlineToolEvts.map((ev, ei) => (
                             <div key={`${trace.callId}-it-${ei}`}>
