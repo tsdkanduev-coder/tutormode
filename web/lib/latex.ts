@@ -17,15 +17,24 @@ export function convertLatexDelimiters(content: string): string {
   if (!content) return content;
 
   let result = content;
+  const trimBlockExpr = (expr: string): string => expr.replace(/^\s+|\s+$/g, "");
+
+  // Fix LLM output where single $ is on its own line (should be $$ for display math)
+  // Pattern: line with only "$", then formula lines, then line with only "$"
+  result = result.replace(/^\$\s*$/gm, "$$$$");
 
   // editor.md examples sometimes wrap \( ... \) inside $$ ... $$.
   // In that case the inner delimiters should be stripped rather than rewrapped.
-  result = result.replace(/\$\$\s*\\\(([\s\S]*?)\\\)\s*\$\$/g, "\n$$\n$1\n$$\n");
+  result = result.replace(/\$\$\s*\\\(([\s\S]*?)\\\)\s*\$\$/g, (_match, expr: string) => {
+    return `\n$$\n${trimBlockExpr(expr)}\n$$\n`;
+  });
 
   // Convert \[...\] to $$...$$ (block math)
   // Use a regex that handles multiline content
   // Note: In JSON strings, \[ becomes \\[ which in JS becomes \[
-  result = result.replace(/\\\[([\s\S]*?)\\\]/g, "\n$$\n$1\n$$\n");
+  result = result.replace(/\\\[([\s\S]*?)\\\]/g, (_match, expr: string) => {
+    return `\n$$\n${trimBlockExpr(expr)}\n$$\n`;
+  });
 
   // Convert \(...\) to $...$ (inline math)
   // Be careful not to match escaped parentheses in other contexts
@@ -42,7 +51,7 @@ export function convertLatexDelimiters(content: string): string {
 }
 
 function normalizeEditorMdHeadings(content: string): string {
-  return content.replace(/^(#{1,6})(\S)/gm, "$1 $2");
+  return content.replace(/^(#{1,6})([^#\s])/gm, "$1 $2");
 }
 
 function normalizeEditorMdInlineMath(content: string): string {

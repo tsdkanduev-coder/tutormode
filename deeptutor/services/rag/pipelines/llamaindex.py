@@ -121,8 +121,8 @@ class LlamaIndexPipeline:
         embedding_cfg = get_embedding_config()
 
         Settings.embed_model = CustomEmbedding()
-        Settings.chunk_size = 512
-        Settings.chunk_overlap = 50
+        Settings.chunk_size = 1024
+        Settings.chunk_overlap = 200
 
         self.logger.info(
             f"LlamaIndex configured: embedding={embedding_cfg.model} "

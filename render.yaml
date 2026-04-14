@@ -1,0 +1,44 @@
+services:
+  - type: web
+    name: deeptutor
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/v1/system/status
+    disk:
+      name: deeptutor-data
+      mountPath: /app/data
+      sizeGB: 10
+    envVars:
+      - key: BACKEND_PORT
+        value: "8001"
+      - key: FRONTEND_PORT
+        value: "3782"
+      - key: LLM_BINDING
+        sync: false
+      - key: LLM_MODEL
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_HOST
+        sync: false
+      - key: LLM_API_VERSION
+        sync: false
+      - key: EMBEDDING_BINDING
+        sync: false
+      - key: EMBEDDING_MODEL
+        sync: false
+      - key: EMBEDDING_API_KEY
+        sync: false
+      - key: EMBEDDING_HOST
+        sync: false
+      - key: EMBEDDING_DIMENSION
+        sync: false
+      - key: EMBEDDING_API_VERSION
+        sync: false
+      - key: SEARCH_PROVIDER
+        sync: false
+      - key: SEARCH_API_KEY
+        sync: false
+      - key: SEARCH_BASE_URL
+        sync: false

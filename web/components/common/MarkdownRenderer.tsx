@@ -23,6 +23,8 @@ function detectMathContent(content: string): boolean {
   // Single-dollar inline math containing LaTeX commands (\cmd) or math operators ({}_^)
   if (/(?:^|[^$\\])\$(?!\$|\s)(?:[^$\n]*(?:\\[a-zA-Z]+|[{}_^]))[^$\n]*\$(?!\$)/m.test(content))
     return true;
+  // Detect lone $ on its own line (LLM outputs block math as $\nformula\n$)
+  if (/^\$\s*$/m.test(content) && /\\[a-zA-Z]+/.test(content)) return true;
   return false;
 }
 

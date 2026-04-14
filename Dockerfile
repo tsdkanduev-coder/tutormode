@@ -106,6 +106,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     bash \
+    nginx \
     supervisor \
     libgl1 \
     libglib2.0-0 \
@@ -191,6 +192,17 @@ stdout_logfile_maxbytes=0
 stderr_logfile=/dev/fd/2
 stderr_logfile_maxbytes=0
 environment=NODE_ENV="production"
+
+[program:proxy]
+command=/bin/bash /app/start-proxy.sh
+directory=/app
+autostart=true
+autorestart=true
+startsecs=3
+stdout_logfile=/dev/fd/1
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/fd/2
+stderr_logfile_maxbytes=0
 EOF
 
 RUN sed -i 's/\r$//' /etc/supervisor/conf.d/deeptutor.conf
@@ -232,6 +244,10 @@ elif [ -n "$NEXT_PUBLIC_API_BASE" ]; then
     # Custom API base URL
     API_BASE="$NEXT_PUBLIC_API_BASE"
     echo "[Frontend] 📌 Using custom API URL: ${API_BASE}"
+elif [ -n "$RENDER_EXTERNAL_URL" ]; then
+    # Render provides the public service URL at runtime
+    API_BASE="$RENDER_EXTERNAL_URL"
+    echo "[Frontend] 📌 Using Render external URL: ${API_BASE}"
 else
     # Default: localhost with configured backend port
     # Note: This only works for local development, not cloud deployments
@@ -257,6 +273,69 @@ EOF
 
 RUN sed -i 's/\r$//' /app/start-frontend.sh && chmod +x /app/start-frontend.sh
 
+# Create reverse proxy startup script
+# This exposes a single public port for cloud platforms like Render while
+# keeping the frontend/backend split internally.
+RUN cat > /app/start-proxy.sh <<'EOF'
+#!/bin/bash
+set -e
+
+PUBLIC_PORT=${PORT:-10000}
+BACKEND_PORT=${BACKEND_PORT:-8001}
+FRONTEND_PORT=${FRONTEND_PORT:-3782}
+
+echo "[Proxy] 🚀 Starting nginx reverse proxy on port ${PUBLIC_PORT}..."
+echo "[Proxy]    Frontend -> 127.0.0.1:${FRONTEND_PORT}"
+echo "[Proxy]    Backend  -> 127.0.0.1:${BACKEND_PORT}"
+
+rm -f /etc/nginx/sites-enabled/default
+
+cat > /etc/nginx/conf.d/default.conf <<NGINX
+map \$http_upgrade \$connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+server {
+    listen ${PUBLIC_PORT};
+    server_name _;
+    client_max_body_size 100M;
+
+    access_log /dev/stdout;
+    error_log /dev/stderr warn;
+
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:${BACKEND_PORT};
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:${FRONTEND_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+    }
+}
+NGINX
+
+exec nginx -g 'daemon off;'
+EOF
+
+RUN sed -i 's/\r$//' /app/start-proxy.sh && chmod +x /app/start-proxy.sh
+
 # Create entrypoint script
 RUN cat > /app/entrypoint.sh <<'EOF'
 #!/bin/bash
@@ -269,9 +348,11 @@ echo "============================================"
 # Set default ports if not provided
 export BACKEND_PORT=${BACKEND_PORT:-8001}
 export FRONTEND_PORT=${FRONTEND_PORT:-3782}
+export PORT=${PORT:-10000}
 
 echo "📌 Backend Port: ${BACKEND_PORT}"
 echo "📌 Frontend Port: ${FRONTEND_PORT}"
+echo "📌 Public Port: ${PORT}"
 
 # Check for required environment variables
 if [ -z "$LLM_API_KEY" ]; then
@@ -307,11 +388,12 @@ EOF
 RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
 # Expose ports
-EXPOSE 8001 3782
+EXPOSE 8001 3782 10000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:${BACKEND_PORT:-8001}/ || exit 1
+    CMD curl -fsS "http://localhost:${PORT:-10000}/api/v1/system/status" >/dev/null || \
+        curl -fsS "http://localhost:${BACKEND_PORT:-8001}/api/v1/system/status" >/dev/null || exit 1
 
 # Set entrypoint
 ENTRYPOINT ["/app/entrypoint.sh"]

@@ -1,9 +1,12 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useMemo } from "react";
 import dynamic from "next/dynamic";
 import ReactMarkdown from "react-markdown";
+import rehypeKatex from "rehype-katex";
+import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { useTranslation } from "react-i18next";
 import "katex/dist/katex.min.css";
 import { processMarkdownContent } from "@/lib/latex";
@@ -28,12 +31,6 @@ const LazyCodeBlock = dynamic(() => import("./RichCodeBlock"), {
   ssr: false,
   loading: () => null,
 });
-
-type PluginBundle = {
-  remarkMath?: unknown;
-  rehypeKatex?: unknown;
-  rehypeRaw?: unknown;
-};
 
 function extractText(children: React.ReactNode): string {
   return React.Children.toArray(children)
@@ -97,45 +94,12 @@ export default function RichMarkdownRenderer({
   allowHtml = false,
 }: MarkdownRendererProps) {
   const normalizedContent = useMemo(() => normalizeMarkdownForDisplay(content), [content]);
-  const [plugins, setPlugins] = useState<PluginBundle>({});
   const isTrace = variant === "trace";
   const gap = isTrace ? "my-1" : variant === "compact" ? "my-2" : "my-4";
   const cellPad =
     isTrace ? "px-1.5 py-1" : variant === "compact" ? "px-2 py-1.5" : "px-3 py-2";
   const headingSpacing = variant === "compact" ? "mt-4 mb-2" : "mt-6 mb-3";
   const textColor = "text-[var(--foreground)]";
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadPlugins() {
-      const nextPlugins: PluginBundle = {};
-
-      if (enableMath) {
-        const [remarkMathModule, rehypeKatexModule] = await Promise.all([
-          import("remark-math"),
-          import("rehype-katex"),
-        ]);
-        nextPlugins.remarkMath = remarkMathModule.default;
-        nextPlugins.rehypeKatex = rehypeKatexModule.default;
-      }
-
-      if (allowHtml) {
-        const rehypeRawModule = await import("rehype-raw");
-        nextPlugins.rehypeRaw = rehypeRawModule.default;
-      }
-
-      if (!cancelled) {
-        setPlugins(nextPlugins);
-      }
-    }
-
-    void loadPlugins();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [allowHtml, enableMath]);
 
   const processedContent = useMemo(() => {
     return enableMath || enableMermaid ? processMarkdownContent(normalizedContent) : normalizedContent;
@@ -482,16 +446,16 @@ export default function RichMarkdownRenderer({
 
   const remarkPlugins = useMemo(() => {
     const p: Array<any> = [remarkGfm];
-    if (plugins.remarkMath) p.push(plugins.remarkMath as never);
+    if (enableMath) p.push(remarkMath as never);
     return p;
-  }, [plugins.remarkMath]);
+  }, [enableMath]);
 
   const rehypePlugins = useMemo(() => {
     const p: Array<any> = [];
-    if (allowHtml && plugins.rehypeRaw) p.push(plugins.rehypeRaw as never);
-    if (enableMath && plugins.rehypeKatex) p.push(plugins.rehypeKatex as never);
+    if (allowHtml) p.push(rehypeRaw as never);
+    if (enableMath) p.push(rehypeKatex as never);
     return p;
-  }, [allowHtml, enableMath, plugins.rehypeRaw, plugins.rehypeKatex]);
+  }, [allowHtml, enableMath]);
 
   return (
     <div className={`${rootClasses} ${className}`}>
