@@ -10,10 +10,9 @@ import React, {
   useRef,
 } from "react";
 import {
-  readStoredActiveSessionId,
   readStoredLanguage,
   writeStoredActiveSessionId,
-} from "@/context/AppShellContext";
+} from "@/context/app-shell-storage";
 import type { StreamEvent, ChatMessage } from "@/lib/unified-ws";
 import { UnifiedWSClient } from "@/lib/unified-ws";
 import { getSession, type SessionMessage } from "@/lib/session-api";
@@ -42,6 +41,8 @@ interface NotebookReferencePayload {
 }
 
 type HistoryReferencePayload = string[];
+
+type QuestionNotebookReferencePayload = number[];
 
 export interface SendMessageOptions {
   displayUserMessage?: boolean;
@@ -85,6 +86,8 @@ export interface MessageRequestSnapshot {
   config?: Record<string, unknown>;
   notebookReferences?: NotebookReferencePayload[];
   historyReferences?: HistoryReferencePayload;
+  questionNotebookReferences?: QuestionNotebookReferencePayload;
+  skills?: string[];
 }
 
 export interface MessageItem {
@@ -123,6 +126,8 @@ type Action =
       attachments?: MessageAttachment[];
       requestSnapshot?: MessageRequestSnapshot;
     }
+  | { type: "POP_LAST_ASSISTANT"; key: string }
+  | { type: "RESTORE_ASSISTANT"; key: string; message: MessageItem }
   | { type: "STREAM_START"; key: string }
   | { type: "STREAM_EVENT"; key: string; event: StreamEvent }
   | { type: "STREAM_END"; key: string; status?: SessionRuntimeStatus; turnId?: string | null }
@@ -223,6 +228,52 @@ function reducer(state: ProviderState, action: Action): ProviderState {
                 ...(action.requestSnapshot ? { requestSnapshot: action.requestSnapshot } : {}),
               },
             ],
+            updatedAt: Date.now(),
+          },
+        },
+      };
+    }
+    case "POP_LAST_ASSISTANT": {
+      const session = state.sessions[action.key];
+      if (!session || session.messages.length === 0) return state;
+      const last = session.messages[session.messages.length - 1];
+      if (last.role !== "assistant") return state;
+      return {
+        ...state,
+        sessions: {
+          ...state.sessions,
+          [action.key]: {
+            ...session,
+            messages: session.messages.slice(0, -1),
+            updatedAt: Date.now(),
+          },
+        },
+      };
+    }
+    case "RESTORE_ASSISTANT": {
+      // Revert an optimistic POP_LAST_ASSISTANT when the server rejects a
+      // regenerate request (e.g. ``regenerate_busy``), so the user doesn't
+      // silently lose their last reply.
+      const session = state.sessions[action.key];
+      if (!session) return state;
+      const messages = [...session.messages];
+      // Drop any placeholder STREAM_START assistant bubble before restoring.
+      while (
+        messages.length > 0 &&
+        messages[messages.length - 1].role === "assistant" &&
+        (messages[messages.length - 1].content ?? "") === "" &&
+        ((messages[messages.length - 1].events?.length ?? 0) === 0)
+      ) {
+        messages.pop();
+      }
+      messages.push(action.message);
+      return {
+        ...state,
+        sessions: {
+          ...state.sessions,
+          [action.key]: {
+            ...session,
+            messages,
             updatedAt: Date.now(),
           },
         },
@@ -351,15 +402,19 @@ function reducer(state: ProviderState, action: Action): ProviderState {
         },
       };
     }
-    case "NEW_SESSION":
-      return {
-        ...state,
-        selectedKey: action.key,
-        sessions: {
-          ...state.sessions,
-          [action.key]: createSessionEntry(action.key),
-        },
-      };
+    case "NEW_SESSION": {
+      const MAX_CACHED_SESSIONS = 20;
+      let nextSessions = { ...state.sessions, [action.key]: createSessionEntry(action.key) };
+      const keys = Object.keys(nextSessions);
+      if (keys.length > MAX_CACHED_SESSIONS) {
+        const evictable = keys
+          .filter((k) => k !== action.key && nextSessions[k].status !== "running")
+          .sort((a, b) => nextSessions[a].updatedAt - nextSessions[b].updatedAt);
+        const toRemove = evictable.slice(0, keys.length - MAX_CACHED_SESSIONS);
+        for (const k of toRemove) delete nextSessions[k];
+      }
+      return { ...state, selectedKey: action.key, sessions: nextSessions };
+    }
     default:
       return state;
   }
@@ -384,8 +439,11 @@ interface ChatContextValue {
     notebookReferences?: NotebookReferencePayload[],
     historyReferences?: HistoryReferencePayload,
     options?: SendMessageOptions,
+    questionNotebookReferences?: QuestionNotebookReferencePayload,
+    skills?: string[],
   ) => void;
   cancelStreamingTurn: () => void;
+  regenerateLastMessage: () => void;
   newSession: () => void;
   loadSession: (sessionId: string) => Promise<void>;
   selectedSessionId: string | null;
@@ -397,7 +455,6 @@ const ChatCtx = createContext<ChatContextValue | null>(null);
 
 export function UnifiedChatProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = useReducer(reducer, initialState);
-  const restoredRef = useRef(false);
   const stateRef = useRef(initialState);
   const runnersRef = useRef<
     Map<
@@ -409,10 +466,25 @@ export function UnifiedChatProvider({ children }: { children: React.ReactNode })
     >
   >(new Map());
   const draftCounterRef = useRef(0);
+  const retryTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+  // Tracks in-flight regenerate requests so we can restore the popped
+  // assistant message if the server rejects the request (e.g. ``regenerate_busy``
+  // or ``nothing_to_regenerate``). Keyed by session entry key.
+  const pendingRegenerateRef = useRef<Map<string, MessageItem>>(new Map());
 
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
+
+  useEffect(
+    () => () => {
+      runnersRef.current.forEach(({ client }) => client.disconnect());
+      runnersRef.current.clear();
+      retryTimersRef.current.forEach((id) => clearTimeout(id));
+      retryTimersRef.current.clear();
+    },
+    [],
+  );
 
   const makeDraftKey = useCallback(() => {
     draftCounterRef.current += 1;
@@ -420,24 +492,28 @@ export function UnifiedChatProvider({ children }: { children: React.ReactNode })
   }, []);
 
   const hydrateMessages = useCallback((messages: SessionMessage[]): MessageItem[] => {
-    return messages.map((message) => ({
-      role: message.role,
-      content:
-        message.role === "assistant"
-          ? normalizeMarkdownForDisplay(message.content)
-          : message.content,
-      capability: message.capability || "",
-      events: Array.isArray(message.events) ? message.events : [],
-      attachments: Array.isArray(message.attachments)
-        ? message.attachments.map((item) => ({
-            type: item.type,
-            filename: item.filename,
-            base64: item.base64,
-            url: item.url,
-            mime_type: item.mime_type,
-          }))
-        : [],
-    }));
+    // System messages (e.g. quiz follow-up grounding context written by the
+    // backend turn runtime) are LLM-only and must not surface in the chat UI.
+    return messages
+      .filter((message) => message.role !== "system")
+      .map((message) => ({
+        role: message.role,
+        content:
+          message.role === "assistant"
+            ? normalizeMarkdownForDisplay(message.content)
+            : message.content,
+        capability: message.capability || "",
+        events: Array.isArray(message.events) ? message.events : [],
+        attachments: Array.isArray(message.attachments)
+          ? message.attachments.map((item) => ({
+              type: item.type,
+              filename: item.filename,
+              base64: item.base64,
+              url: item.url,
+              mime_type: item.mime_type,
+            }))
+          : [],
+      }));
   }, []);
 
   const moveRunner = useCallback((oldKey: string, newKey: string) => {
@@ -479,6 +555,7 @@ export function UnifiedChatProvider({ children }: { children: React.ReactNode })
           status: (status as SessionRuntimeStatus) || "completed",
           turnId: event.turn_id || null,
         });
+        pendingRegenerateRef.current.delete(effectiveKey);
         const runner = runnersRef.current.get(effectiveKey);
         runner?.client.disconnect();
         runnersRef.current.delete(effectiveKey);
@@ -489,6 +566,17 @@ export function UnifiedChatProvider({ children }: { children: React.ReactNode })
         event.type === "error" &&
         Boolean((event.metadata as { turn_terminal?: boolean } | undefined)?.turn_terminal)
       ) {
+        const reason = String((event.metadata as { reason?: string } | undefined)?.reason || "");
+        // Pre-flight regenerate rejections never mutate server state, so we
+        // roll back the optimistic POP_LAST_ASSISTANT/STREAM_START placeholder
+        // to keep the transcript in sync with the server.
+        if (reason === "regenerate_busy" || reason === "nothing_to_regenerate") {
+          const stash = pendingRegenerateRef.current.get(effectiveKey);
+          if (stash) {
+            dispatch({ type: "RESTORE_ASSISTANT", key: effectiveKey, message: stash });
+          }
+        }
+        pendingRegenerateRef.current.delete(effectiveKey);
         const status = String((event.metadata as { status?: string } | undefined)?.status || "failed");
         dispatch({
           type: "STREAM_END",
@@ -505,6 +593,10 @@ export function UnifiedChatProvider({ children }: { children: React.ReactNode })
     (key: string) => {
       const existing = runnersRef.current.get(key);
       if (existing) {
+        const session = stateRef.current.sessions[key];
+        if (session) {
+          existing.client.setResumeState(session.activeTurnId, session.lastSeq);
+        }
         if (!existing.client.connected) existing.client.connect();
         return existing;
       }
@@ -536,7 +628,11 @@ export function UnifiedChatProvider({ children }: { children: React.ReactNode })
           dispatch({ type: "STREAM_END", key, status: "failed" });
           return;
         }
-        window.setTimeout(() => dispatchToRunner(key, msg, attempt + 1), 200);
+        const timerId = setTimeout(() => {
+          retryTimersRef.current.delete(timerId);
+          dispatchToRunner(key, msg, attempt + 1);
+        }, 200);
+        retryTimersRef.current.add(timerId);
         return;
       }
       runner.client.send(msg);
@@ -580,19 +676,51 @@ export function UnifiedChatProvider({ children }: { children: React.ReactNode })
     writeStoredActiveSessionId(current?.sessionId ?? null);
   }, [state.selectedKey, state.sessions]);
 
+  // URL is now the source of truth for session loading.
+  // Chat pages load sessions based on URL params; no sessionStorage restore needed.
+  // Initialize a draft session so the provider always has a selected key.
   useEffect(() => {
-    if (restoredRef.current || typeof window === "undefined") return;
-    restoredRef.current = true;
-    const savedSessionId = readStoredActiveSessionId();
-    if (savedSessionId) {
-      void loadSession(savedSessionId).catch(() => {
-        writeStoredActiveSessionId(null);
-        dispatch({ type: "NEW_SESSION", key: makeDraftKey() });
-      });
-      return;
+    if (typeof window === "undefined") return;
+    if (!state.selectedKey) {
+      dispatch({ type: "NEW_SESSION", key: makeDraftKey() });
     }
-    dispatch({ type: "NEW_SESSION", key: makeDraftKey() });
-  }, [loadSession, makeDraftKey]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Idle timeout: if a streaming session receives no events for 60s, auto-fail it.
+  useEffect(() => {
+    const IDLE_TIMEOUT_MS = 60_000;
+    const CHECK_INTERVAL_MS = 10_000;
+
+    const timer = setInterval(() => {
+      const current = stateRef.current;
+      for (const [key, session] of Object.entries(current.sessions)) {
+        if (!session.isStreaming) continue;
+        if (Date.now() - session.updatedAt <= IDLE_TIMEOUT_MS) continue;
+
+        dispatch({
+          type: "STREAM_EVENT",
+          key,
+          event: {
+            type: "error",
+            source: "client",
+            stage: "",
+            content: "Connection timed out — no response received for 60 seconds.",
+            metadata: { turn_terminal: true, status: "failed" },
+            timestamp: Date.now() / 1000,
+          },
+        });
+        dispatch({ type: "STREAM_END", key, status: "failed" });
+
+        const runner = runnersRef.current.get(key);
+        if (runner) {
+          runner.client.disconnect();
+          runnersRef.current.delete(key);
+        }
+      }
+    }, CHECK_INTERVAL_MS);
+
+    return () => clearInterval(timer);
+  }, []);
 
   const sendMessage = useCallback(
     (
@@ -602,6 +730,8 @@ export function UnifiedChatProvider({ children }: { children: React.ReactNode })
       notebookReferences?: NotebookReferencePayload[],
       historyReferences?: HistoryReferencePayload,
       options?: SendMessageOptions,
+      questionNotebookReferences?: QuestionNotebookReferencePayload,
+      skills?: string[],
     ) => {
       const msgAttachments = attachments?.map((a) => ({
         type: a.type,
@@ -628,6 +758,7 @@ export function UnifiedChatProvider({ children }: { children: React.ReactNode })
       const shouldSendKnowledgeBases =
         effectiveTools.includes("rag") ||
         (effectiveCapability === "deep_research" && researchSources.includes("kb"));
+      const effectiveSkills = replaySnapshot?.skills ?? skills;
       const requestSnapshot: MessageRequestSnapshot = replaySnapshot ?? {
         content,
         capability: effectiveCapability,
@@ -638,6 +769,10 @@ export function UnifiedChatProvider({ children }: { children: React.ReactNode })
         ...(config && Object.keys(config).length > 0 ? { config } : {}),
         ...(notebookReferences?.length ? { notebookReferences } : {}),
         ...(historyReferences?.length ? { historyReferences: [...historyReferences] } : {}),
+        ...(questionNotebookReferences?.length
+          ? { questionNotebookReferences: [...questionNotebookReferences] }
+          : {}),
+        ...(effectiveSkills?.length ? { skills: [...effectiveSkills] } : {}),
       };
       if (options?.displayUserMessage !== false) {
         dispatch({
@@ -669,6 +804,10 @@ export function UnifiedChatProvider({ children }: { children: React.ReactNode })
         ...(historyReferences?.length
           ? { history_references: historyReferences }
           : {}),
+        ...(questionNotebookReferences?.length
+          ? { question_notebook_references: questionNotebookReferences }
+          : {}),
+        ...(effectiveSkills?.length ? { skills: effectiveSkills } : {}),
         ...(effectiveConfig && Object.keys(effectiveConfig).length > 0
           ? { config: effectiveConfig }
           : {}),
@@ -692,6 +831,32 @@ export function UnifiedChatProvider({ children }: { children: React.ReactNode })
     }
     dispatch({ type: "STREAM_END", key, status: "cancelled" });
   }, []);
+
+  const regenerateLastMessage = useCallback(() => {
+    const currentState = stateRef.current;
+    const key = currentState.selectedKey;
+    if (!key) return;
+    const session = currentState.sessions[key];
+    if (!session || !session.sessionId) return;
+    if (session.isStreaming) return;
+    const lastUser = [...session.messages].reverse().find((m) => m.role === "user");
+    if (!lastUser) return;
+    // Snapshot the trailing assistant (if any) so we can put it back when the
+    // server rejects the request. We intentionally keep events/attachments so
+    // the restored bubble round-trips identically.
+    const lastMessage = session.messages[session.messages.length - 1];
+    if (lastMessage && lastMessage.role === "assistant") {
+      pendingRegenerateRef.current.set(key, { ...lastMessage });
+    } else {
+      pendingRegenerateRef.current.delete(key);
+    }
+    dispatch({ type: "POP_LAST_ASSISTANT", key });
+    dispatch({ type: "STREAM_START", key });
+    sendThroughRunner(key, {
+      type: "regenerate",
+      session_id: session.sessionId,
+    });
+  }, [sendThroughRunner]);
 
   const derivedState = useMemo<ChatState>(() => {
     const current = ensureSelectedSession(state);
@@ -749,6 +914,7 @@ export function UnifiedChatProvider({ children }: { children: React.ReactNode })
     setLanguage,
     sendMessage,
     cancelStreamingTurn,
+    regenerateLastMessage,
     newSession,
     loadSession,
     selectedSessionId: derivedState.sessionId,

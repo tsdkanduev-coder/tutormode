@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Bot,
+  Eye,
+  EyeOff,
   FileText,
   Heart,
   Loader2,
@@ -11,6 +13,7 @@ import {
   Play,
   Plus,
   Save,
+  Settings2,
   Square,
   Trash2,
   X,
@@ -31,10 +34,18 @@ interface BotInfo {
   name: string;
   description: string;
   persona: string;
+  /**
+   * From `GET /tutorbot` (list): channel name keys only — never carries secrets.
+   * The single-bot detail endpoint returns a richer dict; ChannelsTab fetches
+   * it explicitly via `?include_secrets=true` and works with that shape directly,
+   * so this list-shape type is sufficient here.
+   */
   channels: string[];
   model: string | null;
   running: boolean;
   started_at: string | null;
+  /** Set when a previous PATCH succeeded but `reload_channels` failed. */
+  last_reload_error?: string | null;
 }
 
 interface SoulTemplate {
@@ -43,7 +54,7 @@ interface SoulTemplate {
   content: string;
 }
 
-type Tab = "bots" | "profiles" | "souls";
+type Tab = "bots" | "profiles" | "channels" | "souls";
 
 const BOT_FILES = ["SOUL.md", "USER.md", "TOOLS.md", "AGENTS.md", "HEARTBEAT.md"] as const;
 type BotFile = (typeof BOT_FILES)[number];
@@ -106,6 +117,7 @@ export default function AgentsPage() {
           {([
             { key: "bots" as Tab, label: t("Bots"), icon: Bot },
             { key: "profiles" as Tab, label: t("Profiles"), icon: FileText },
+            { key: "channels" as Tab, label: t("Channels"), icon: Settings2 },
             { key: "souls" as Tab, label: t("Souls"), icon: Heart },
           ]).map((tab) => {
             const Icon = tab.icon;
@@ -138,10 +150,546 @@ export default function AgentsPage() {
           />
         ) : activeTab === "profiles" ? (
           <ProfilesTab bots={bots} loading={loading} onToast={setToast} />
+        ) : activeTab === "channels" ? (
+          <ChannelsTab bots={bots} loading={loading} onToast={setToast} onReload={loadBots} />
         ) : (
           <SoulsTab souls={souls} onReload={loadSouls} onToast={setToast} />
         )}
       </div>
+    </div>
+  );
+}
+
+/* ── Channels tab (schema-driven, all channels) ─────────── */
+
+/**
+ * JSON-Schema fragment subset we actually consume. Pydantic emits richer
+ * shapes (allOf / examples / formats) that we ignore — the form gracefully
+ * falls back to a text input for anything it doesn't recognise.
+ */
+type JsonSchema = {
+  type?: string | string[];
+  title?: string;
+  description?: string;
+  default?: unknown;
+  enum?: unknown[];
+  properties?: Record<string, JsonSchema>;
+  items?: JsonSchema;
+  anyOf?: JsonSchema[];
+};
+
+interface ChannelSchemaEntry {
+  name: string;
+  display_name: string;
+  default_config: Record<string, unknown>;
+  secret_fields: string[];
+  json_schema: JsonSchema;
+}
+
+interface ChannelsSchemaResponse {
+  channels: Record<string, ChannelSchemaEntry>;
+  global: { json_schema: JsonSchema; secret_fields: string[] };
+}
+
+/** Pick the first non-null variant of an `anyOf` and merge its meta. */
+function resolveSchemaVariant(s: JsonSchema): JsonSchema {
+  if (!s.anyOf) return s;
+  const first = s.anyOf.find((v) => v.type !== "null") ?? s.anyOf[0];
+  return { ...first, title: s.title ?? first.title, description: s.description ?? first.description };
+}
+
+/** True iff this schema's value can be `null` (e.g. `Optional[str]`). */
+function isNullable(s: JsonSchema): boolean {
+  if (Array.isArray(s.type) && s.type.includes("null")) return true;
+  if (s.anyOf?.some((v) => v.type === "null")) return true;
+  return false;
+}
+
+/** Default value for a property when the live config doesn't set it. */
+function defaultFor(s: JsonSchema): unknown {
+  if (s.default !== undefined) return s.default;
+  const v = resolveSchemaVariant(s);
+  switch (v.type) {
+    case "boolean": return false;
+    case "integer":
+    case "number": return 0;
+    case "array": return [];
+    case "object": return {};
+    case "string":
+    default: return "";
+  }
+}
+
+/** Title-case a snake_case key when no `title` is provided. */
+function humaniseKey(k: string): string {
+  return k.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/** Generic field renderer — recursive for nested objects. */
+function SchemaField({
+  fieldKey,
+  schema,
+  value,
+  onChange,
+  secretFields,
+  path,
+  showSecretFor,
+  toggleSecret,
+}: {
+  fieldKey: string;
+  schema: JsonSchema;
+  value: unknown;
+  onChange: (next: unknown) => void;
+  secretFields: Set<string>;
+  path: string;
+  showSecretFor: Set<string>;
+  toggleSecret: (path: string) => void;
+}) {
+  const v = resolveSchemaVariant(schema);
+  const label = schema.title || v.title || humaniseKey(fieldKey);
+  const description = schema.description || v.description;
+  const isSecret = secretFields.has(path);
+  const enumValues = (v.enum ?? schema.enum) as unknown[] | undefined;
+
+  // Boolean → checkbox row (label inline).
+  if (v.type === "boolean") {
+    return (
+      <label className="flex items-start gap-2 text-[13px]">
+        <input
+          type="checkbox"
+          checked={!!value}
+          onChange={(e) => onChange(e.target.checked)}
+          className="mt-0.5"
+        />
+        <span>
+          {label}
+          {description && (
+            <span className="ml-1 text-[11px] text-[var(--muted-foreground)]">— {description}</span>
+          )}
+        </span>
+      </label>
+    );
+  }
+
+  // Enum / Literal → select.
+  if (Array.isArray(enumValues) && enumValues.length > 0) {
+    return (
+      <div>
+        <FieldLabel label={label} description={description} />
+        <select
+          value={String(value ?? "")}
+          onChange={(e) => onChange(e.target.value)}
+          className="rounded-lg border border-[var(--border)] bg-transparent px-3 py-1.5 text-[13px] outline-none focus:border-[var(--ring)]"
+        >
+          {enumValues.map((opt) => (
+            <option key={String(opt)} value={String(opt)}>{String(opt)}</option>
+          ))}
+        </select>
+      </div>
+    );
+  }
+
+  // Array of strings → textarea (one per line). For non-string arrays we
+  // fall through to JSON editing below.
+  if (v.type === "array" && (v.items?.type === "string" || !v.items)) {
+    const lines = Array.isArray(value) ? (value as unknown[]).map(String) : [];
+    return (
+      <div>
+        <FieldLabel label={label} description={description ?? "One value per line"} />
+        <textarea
+          value={lines.join("\n")}
+          onChange={(e) =>
+            onChange(e.target.value.split("\n").map((s) => s.trim()).filter(Boolean))
+          }
+          rows={Math.max(3, Math.min(8, lines.length + 1))}
+          className="w-full rounded-lg border border-[var(--border)] bg-transparent px-3 py-2 font-mono text-[13px] outline-none focus:border-[var(--ring)]"
+        />
+      </div>
+    );
+  }
+
+  // Nested object → recursive fieldset.
+  if (v.type === "object" && v.properties) {
+    const obj = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+    return (
+      <fieldset className="rounded-lg border border-[var(--border)]/60 px-3 py-2.5 space-y-2.5">
+        <legend className="px-1 text-[12px] font-medium text-[var(--muted-foreground)]">{label}</legend>
+        {description && <p className="text-[11px] text-[var(--muted-foreground)]">{description}</p>}
+        {Object.entries(v.properties).map(([k, child]) => (
+          <SchemaField
+            key={k}
+            fieldKey={k}
+            schema={child}
+            value={obj[k] ?? defaultFor(child)}
+            onChange={(next) => onChange({ ...obj, [k]: next })}
+            secretFields={secretFields}
+            path={path ? `${path}.${k}` : k}
+            showSecretFor={showSecretFor}
+            toggleSecret={toggleSecret}
+          />
+        ))}
+      </fieldset>
+    );
+  }
+
+  // Integer/number → number input.
+  if (v.type === "integer" || v.type === "number") {
+    return (
+      <div>
+        <FieldLabel label={label} description={description} />
+        <input
+          type="number"
+          value={typeof value === "number" ? value : ""}
+          onChange={(e) => {
+            const raw = e.target.value;
+            if (raw === "") onChange(isNullable(schema) ? null : 0);
+            else onChange(v.type === "integer" ? parseInt(raw, 10) : parseFloat(raw));
+          }}
+          className="w-40 rounded-lg border border-[var(--border)] bg-transparent px-3 py-1.5 text-[13px] outline-none focus:border-[var(--ring)]"
+        />
+      </div>
+    );
+  }
+
+  // Default: string input (with secret reveal handling).
+  const reveal = showSecretFor.has(path);
+  const strVal = value == null ? "" : String(value);
+  return (
+    <div>
+      <FieldLabel label={label} description={description} />
+      <div className="relative">
+        <input
+          type={isSecret && !reveal ? "password" : "text"}
+          autoComplete={isSecret ? "new-password" : "off"}
+          spellCheck={!isSecret}
+          value={strVal}
+          onChange={(e) => {
+            const next = e.target.value;
+            // Empty optional strings persist as null (matches Pydantic's
+            // `Optional[str]` default and avoids "" sneaking past validators).
+            onChange(next === "" && isNullable(schema) ? null : next);
+          }}
+          className={`w-full rounded-lg border border-[var(--border)] bg-transparent py-2 pl-3 ${isSecret ? "pr-10 font-mono" : "pr-3"} text-[13px] outline-none focus:border-[var(--ring)]`}
+        />
+        {isSecret && (
+          <button
+            type="button"
+            onClick={() => toggleSecret(path)}
+            className="absolute right-1 top-1/2 -translate-y-1/2 rounded-md p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
+            aria-label={reveal ? "Hide secret" : "Show secret"}
+            title={reveal ? "Hide secret" : "Show secret"}
+          >
+            {reveal ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function FieldLabel({ label, description }: { label: string; description?: string }) {
+  return (
+    <label className="mb-1 block text-[12px] font-medium text-[var(--muted-foreground)]">
+      {label}
+      {description && <span className="ml-1 font-normal opacity-70">— {description}</span>}
+    </label>
+  );
+}
+
+function ChannelsTab({
+  bots,
+  loading,
+  onToast,
+  onReload,
+}: {
+  bots: BotInfo[];
+  loading: boolean;
+  onToast: (msg: string) => void;
+  onReload: () => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const [selectedBot, setSelectedBot] = useState("");
+  const [schemaCatalog, setSchemaCatalog] = useState<ChannelsSchemaResponse | null>(null);
+  const [channels, setChannels] = useState<Record<string, unknown>>({});
+  const [activeChannel, setActiveChannel] = useState<string | null>(null);
+  const [reloadError, setReloadError] = useState<string | null>(null);
+  const [loadingDetail, setLoadingDetail] = useState(false);
+  const [saving, setSaving] = useState(false);
+  /** dot-paths of secrets the user has explicitly toggled to plaintext. */
+  const [revealed, setRevealed] = useState<Set<string>>(new Set());
+
+  // One-time fetch of the channel schema catalog. Cheap and never changes
+  // at runtime (channels are discovered at process start).
+  useEffect(() => {
+    void (async () => {
+      try {
+        const res = await fetch(apiUrl("/api/v1/tutorbot/channels/schema"));
+        if (res.ok) setSchemaCatalog(await res.json());
+      } catch { /* leave catalog null → renders fallback message */ }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (bots.length > 0 && !selectedBot) setSelectedBot(bots[0].bot_id);
+  }, [bots, selectedBot]);
+
+  useEffect(() => {
+    setRevealed(new Set());
+    setReloadError(null);
+  }, [selectedBot]);
+
+  const loadDetail = useCallback(async (bid: string) => {
+    if (!bid) return;
+    setLoadingDetail(true);
+    try {
+      // Edit form needs raw secrets to populate fields. Default GET masks them.
+      const res = await fetch(apiUrl(`/api/v1/tutorbot/${bid}?include_secrets=true`));
+      if (!res.ok) return;
+      const data = await res.json();
+      const raw = (data.channels ?? {}) as Record<string, unknown>;
+      // Surface globals as-is; per-channel dicts are passed straight to the
+      // SchemaForm which handles per-field defaults from the JSON schema.
+      setChannels({
+        send_progress: raw.send_progress !== false,
+        send_tool_hints: !!raw.send_tool_hints,
+        ...Object.fromEntries(
+          Object.entries(raw).filter(([k]) => k !== "send_progress" && k !== "send_tool_hints"),
+        ),
+      });
+      setReloadError(
+        typeof data.last_reload_error === "string" ? data.last_reload_error : null,
+      );
+    } finally {
+      setLoadingDetail(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (selectedBot) void loadDetail(selectedBot);
+  }, [selectedBot, loadDetail]);
+
+  // Pick a sensible default active channel: prefer one already enabled,
+  // otherwise the first channel in the catalog.
+  useEffect(() => {
+    if (activeChannel || !schemaCatalog) return;
+    const names = Object.keys(schemaCatalog.channels);
+    const enabled = names.find((n) => {
+      const cfg = channels[n];
+      return cfg && typeof cfg === "object" && (cfg as Record<string, unknown>).enabled === true;
+    });
+    setActiveChannel(enabled ?? names[0] ?? null);
+  }, [schemaCatalog, channels, activeChannel]);
+
+  const toggleSecret = useCallback((path: string) => {
+    setRevealed((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }, []);
+
+  const setActiveChannelConfig = (next: unknown) => {
+    if (!activeChannel) return;
+    setChannels((prev) => ({ ...prev, [activeChannel]: next }));
+  };
+
+  const save = async () => {
+    if (!selectedBot) return;
+    setSaving(true);
+    try {
+      const res = await fetch(apiUrl(`/api/v1/tutorbot/${selectedBot}`), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channels }),
+      });
+      if (res.ok) {
+        onToast(t("Channels saved"));
+        await Promise.all([onReload(), loadDetail(selectedBot)]);
+      } else if (res.status === 422) {
+        const err = (await res.json().catch(() => ({}))) as {
+          detail?: { message?: string; errors?: unknown } | string;
+        };
+        const detail = err.detail;
+        const msg =
+          typeof detail === "string"
+            ? detail
+            : detail?.message ?? t("Invalid channel configuration");
+        onToast(msg);
+      } else {
+        const err = (await res.json().catch(() => ({}))) as { detail?: string };
+        onToast(err.detail ?? t("Save failed"));
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex min-h-[320px] items-center justify-center">
+        <Loader2 className="h-5 w-5 animate-spin text-[var(--muted-foreground)]" />
+      </div>
+    );
+  }
+
+  if (bots.length === 0) {
+    return (
+      <div className="flex min-h-[320px] flex-col items-center justify-center rounded-xl border border-dashed border-[var(--border)] text-center">
+        <p className="text-[14px] font-medium text-[var(--foreground)]">{t("No bots to configure")}</p>
+        <p className="mt-1.5 max-w-xs text-[13px] text-[var(--muted-foreground)]">
+          {t("Create a bot first in the Bots tab.")}
+        </p>
+      </div>
+    );
+  }
+
+  const channelEntries = schemaCatalog
+    ? Object.entries(schemaCatalog.channels).sort(([, a], [, b]) =>
+        a.display_name.localeCompare(b.display_name),
+      )
+    : [];
+  const activeEntry = activeChannel ? schemaCatalog?.channels[activeChannel] : undefined;
+  const activeValue =
+    activeChannel && channels[activeChannel] && typeof channels[activeChannel] === "object"
+      ? (channels[activeChannel] as Record<string, unknown>)
+      : (activeEntry?.default_config ?? {});
+  const activeSecretSet = new Set(activeEntry?.secret_fields ?? []);
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-center gap-3">
+        <label className="text-[12px] font-medium text-[var(--muted-foreground)] shrink-0">{t("Bot")}</label>
+        <select
+          value={selectedBot}
+          onChange={(e) => setSelectedBot(e.target.value)}
+          className="rounded-lg border border-[var(--border)] bg-transparent px-3 py-1.5 text-[13px] text-[var(--foreground)] outline-none focus:border-[var(--ring)]"
+        >
+          {bots.map((b) => (
+            <option key={b.bot_id} value={b.bot_id}>
+              {b.name} ({b.bot_id})
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          onClick={() => void save()}
+          disabled={saving || loadingDetail}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--primary)] px-3 py-1.5 text-[12px] font-medium text-[var(--primary-foreground)] disabled:opacity-40"
+        >
+          {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+          {t("Save")}
+        </button>
+      </div>
+
+      {reloadError && (
+        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[12px] text-amber-700 dark:text-amber-300">
+          <strong className="font-medium">{t("Channel listeners failed to restart:")}</strong>{" "}
+          <span className="font-mono">{reloadError}</span>{" "}
+          <span className="opacity-80">
+            {t("Config is saved on disk; stop and start the bot to apply.")}
+          </span>
+        </div>
+      )}
+
+      {loadingDetail || !schemaCatalog ? (
+        <div className="flex justify-center py-8">
+          <Loader2 className="h-5 w-5 animate-spin text-[var(--muted-foreground)]" />
+        </div>
+      ) : (
+        <>
+          {/* Globals (Delivery) */}
+          <div className="rounded-xl border border-[var(--border)] p-4 space-y-3">
+            <h3 className="text-[13px] font-medium text-[var(--foreground)]">{t("Delivery")}</h3>
+            <label className="flex items-center gap-2 text-[13px]">
+              <input
+                type="checkbox"
+                checked={!!channels.send_progress}
+                onChange={(e) => setChannels((c) => ({ ...c, send_progress: e.target.checked }))}
+              />
+              {t("Stream progress text to channels")}
+            </label>
+            <label className="flex items-center gap-2 text-[13px]">
+              <input
+                type="checkbox"
+                checked={!!channels.send_tool_hints}
+                onChange={(e) => setChannels((c) => ({ ...c, send_tool_hints: e.target.checked }))}
+              />
+              {t("Stream tool hints to channels")}
+            </label>
+          </div>
+
+          {/* Channel master-detail */}
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-[180px_1fr]">
+            <aside className="rounded-xl border border-[var(--border)] p-2 h-fit">
+              <ul className="space-y-0.5">
+                {channelEntries.map(([name, entry]) => {
+                  const cfg = channels[name] as Record<string, unknown> | undefined;
+                  const enabled = cfg?.enabled === true;
+                  const isActive = activeChannel === name;
+                  return (
+                    <li key={name}>
+                      <button
+                        type="button"
+                        onClick={() => setActiveChannel(name)}
+                        className={`group flex w-full items-center justify-between rounded-md px-2.5 py-1.5 text-left text-[13px] transition-colors ${
+                          isActive
+                            ? "bg-[var(--muted)] font-medium text-[var(--foreground)]"
+                            : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                        }`}
+                      >
+                        <span className="truncate">{entry.display_name}</span>
+                        {enabled && (
+                          <span
+                            aria-label={t("Enabled")}
+                            title={t("Enabled")}
+                            className="ml-2 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500"
+                          />
+                        )}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </aside>
+
+            <section className="rounded-xl border border-[var(--border)] p-4 space-y-3">
+              {!activeEntry ? (
+                <p className="text-[13px] text-[var(--muted-foreground)]">{t("Select a channel.")}</p>
+              ) : (
+                <>
+                  <div className="flex items-baseline justify-between">
+                    <h3 className="text-[14px] font-medium text-[var(--foreground)]">
+                      {activeEntry.display_name}
+                    </h3>
+                    <code className="text-[11px] text-[var(--muted-foreground)]">{activeEntry.name}</code>
+                  </div>
+                  {activeEntry.json_schema.description && (
+                    <p className="text-[11px] text-[var(--muted-foreground)]">
+                      {activeEntry.json_schema.description}
+                    </p>
+                  )}
+                  {Object.entries(activeEntry.json_schema.properties ?? {}).map(([k, child]) => (
+                    <SchemaField
+                      key={k}
+                      fieldKey={k}
+                      schema={child}
+                      value={activeValue[k] ?? defaultFor(child)}
+                      onChange={(next) =>
+                        setActiveChannelConfig({ ...activeValue, [k]: next })
+                      }
+                      secretFields={activeSecretSet}
+                      path={k}
+                      showSecretFor={revealed}
+                      toggleSecret={toggleSecret}
+                    />
+                  ))}
+                </>
+              )}
+            </section>
+          </div>
+        </>
+      )}
     </div>
   );
 }

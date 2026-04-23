@@ -21,7 +21,7 @@ from llama_index.core.bridge.pydantic import PrivateAttr
 
 from deeptutor.logging import get_logger
 from deeptutor.services.embedding import get_embedding_client, get_embedding_config
-from deeptutor.services.rag.components.routing import FileTypeRouter
+from deeptutor.services.rag.file_routing import FileTypeRouter
 
 # Default knowledge base directory
 DEFAULT_KB_BASE_DIR = str(
@@ -42,11 +42,18 @@ class CustomEmbedding(BaseEmbedding):
 
     _client: Any = PrivateAttr()
     _logger: Any = PrivateAttr()
+    _progress_callback: Any = PrivateAttr(default=None)
 
     def __init__(self, **kwargs):
+        progress_cb = kwargs.pop("progress_callback", None)
         super().__init__(**kwargs)
         self._client = get_embedding_client()
         self._logger = get_logger("CustomEmbedding")
+        self._progress_callback = progress_cb
+
+    def set_progress_callback(self, callback):
+        """Set progress callback fn(batch_num, total_batches)."""
+        self._progress_callback = callback
 
     @classmethod
     def class_name(cls) -> str:
@@ -67,16 +74,31 @@ class CustomEmbedding(BaseEmbedding):
     async def _aget_query_embedding(self, query: str) -> List[float]:
         """Get embedding for a query."""
         embeddings = await self._client.embed([query])
+        if not embeddings or embeddings[0] is None:
+            # Surface a clear error so the chat layer can show a meaningful
+            # message instead of crashing later in similarity computation
+            # with ``TypeError: unsupported operand type(s) for *: 'NoneType' and 'float'``.
+            raise ValueError(
+                "Embedding provider returned None for query vector. "
+                "Check the embedding API configuration and connectivity."
+            )
         return embeddings[0]
 
     async def _aget_text_embedding(self, text: str) -> List[float]:
         """Get embedding for a text."""
         embeddings = await self._client.embed([text])
+        if not embeddings or embeddings[0] is None:
+            raise ValueError(
+                "Embedding provider returned None for text vector. "
+                "Check the embedding API configuration and connectivity."
+            )
         return embeddings[0]
 
     async def _aget_text_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Get embeddings for multiple texts."""
-        return await self._client.embed(texts)
+        return await self._client.embed(
+            texts, progress_callback=self._progress_callback
+        )
 
     def _get_query_embedding(self, query: str) -> List[float]:
         """Sync version - called by LlamaIndex sync API."""
@@ -88,9 +110,35 @@ class CustomEmbedding(BaseEmbedding):
 
     def _get_text_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Sync batch version - called by LlamaIndex for bulk embedding."""
-        self._logger.info(f"Embedding batch of {len(texts)} texts...")
+        self._logger.info(f"Embedding {len(texts)} text chunks...")
         result = self._run_in_new_loop(self._aget_text_embeddings(texts))
-        self._logger.info(f"Batch embedding complete: {len(result)} vectors")
+        # Guard against None embeddings that would crash similarity computation
+        none_indices = [i for i, vec in enumerate(result) if vec is None]
+        if none_indices:
+            # Determine dimension: prefer a sibling vector, fall back to configured dim,
+            # raise if neither is available (otherwise we'd persist zero-length vectors
+            # that crash retrieval later, which is exactly what this guard tries to avoid).
+            dim = next((len(v) for v in result if v is not None), 0)
+            if dim == 0:
+                try:
+                    dim = int(get_embedding_config().dim or 0)
+                except Exception:
+                    dim = 0
+            if dim <= 0:
+                raise ValueError(
+                    f"Embedding provider returned None for all {len(texts)} chunk(s) "
+                    "and no fallback dimension is configured. Check the embedding "
+                    "API configuration and connectivity."
+                )
+            self._logger.error(
+                f"Embedding returned None for {len(none_indices)} chunk(s) "
+                f"at indices {none_indices}. These will be replaced with "
+                f"{dim}-dim zero vectors to prevent storage corruption. "
+                "Affected chunks will not be retrievable; consider re-indexing."
+            )
+            for i in none_indices:
+                result[i] = [0.0] * dim
+        self._logger.info(f"Embedding complete: {len(result)} vectors")
         return result
 
 
@@ -153,11 +201,13 @@ class LlamaIndexPipeline:
         Args:
             kb_name: Knowledge base name
             file_paths: List of file paths to process
-            **kwargs: Additional arguments
+            **kwargs: Additional arguments (accepts progress_callback)
 
         Returns:
             True if successful
         """
+        progress_callback = kwargs.get("progress_callback")
+
         self.logger.info(
             f"Initializing KB '{kb_name}' with {len(file_paths)} files using LlamaIndex"
         )
@@ -222,6 +272,9 @@ class LlamaIndexPipeline:
                 f"(chunking + embedding)..."
             )
 
+            if progress_callback and isinstance(Settings.embed_model, CustomEmbedding):
+                Settings.embed_model.set_progress_callback(progress_callback)
+
             loop = asyncio.get_event_loop()
             index = await loop.run_in_executor(
                 None,
@@ -241,6 +294,9 @@ class LlamaIndexPipeline:
 
             self.logger.error(traceback.format_exc())
             return False
+        finally:
+            if isinstance(Settings.embed_model, CustomEmbedding):
+                Settings.embed_model.set_progress_callback(None)
 
     def _extract_pdf_text(self, file_path: Path) -> str:
         """Extract text from PDF using PyMuPDF."""
@@ -293,6 +349,25 @@ class LlamaIndexPipeline:
                 "provider": "llamaindex",
             }
 
+        embedding_mismatch_warning = ""
+        try:
+            import json as _json
+
+            cfg_path = Path(self.kb_base_dir) / "kb_config.json"
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as _f:
+                    kb_entry = _json.load(_f).get("knowledge_bases", {}).get(kb_name, {})
+                if kb_entry.get("embedding_mismatch"):
+                    stored = kb_entry.get("embedding_model", "unknown")
+                    current = get_embedding_config().model
+                    embedding_mismatch_warning = (
+                        f"Warning: KB '{kb_name}' was indexed with '{stored}' "
+                        f"but current model is '{current}'. Re-index recommended."
+                    )
+                    self.logger.warning(embedding_mismatch_warning)
+        except Exception:
+            pass
+
         try:
             # Load index from storage (run in thread pool)
             loop = asyncio.get_event_loop()
@@ -326,13 +401,16 @@ class LlamaIndexPipeline:
 
             content = "\n\n".join(context_parts) if context_parts else ""
 
-            return {
+            result: Dict[str, Any] = {
                 "query": query,
                 "answer": content,
                 "content": content,
                 "sources": sources,
                 "provider": "llamaindex",
             }
+            if embedding_mismatch_warning:
+                result["warning"] = embedding_mismatch_warning
+            return result
 
         except Exception as e:
             self.logger.error(f"Search failed: {e}")
@@ -356,11 +434,13 @@ class LlamaIndexPipeline:
         Args:
             kb_name: Knowledge base name
             file_paths: List of file paths to add
-            **kwargs: Additional arguments
+            **kwargs: Additional arguments (accepts progress_callback)
 
         Returns:
             True if successful
         """
+        progress_callback = kwargs.get("progress_callback")
+
         self.logger.info(f"Adding {len(file_paths)} documents to KB '{kb_name}' using LlamaIndex")
 
         kb_dir = Path(self.kb_base_dir) / kb_name
@@ -368,6 +448,9 @@ class LlamaIndexPipeline:
 
         try:
             await self._verify_embedding_connectivity()
+
+            if progress_callback and isinstance(Settings.embed_model, CustomEmbedding):
+                Settings.embed_model.set_progress_callback(progress_callback)
 
             # Parse new documents with centralized file routing
             documents = []
@@ -458,6 +541,9 @@ class LlamaIndexPipeline:
 
             self.logger.error(traceback.format_exc())
             return False
+        finally:
+            if isinstance(Settings.embed_model, CustomEmbedding):
+                Settings.embed_model.set_progress_callback(None)
 
     async def delete(self, kb_name: str) -> bool:
         """

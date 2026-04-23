@@ -118,6 +118,33 @@ export function buildQuizFollowupConfig(
   };
 }
 
+function titleCase(value: string): string {
+  if (!value) return "";
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+/**
+ * One-line summary of the quiz form, shown next to the collapsed `Settings`
+ * chevron in the composer. Pass `translate` (`t` from `react-i18next`) so the
+ * summary follows the active UI language.
+ */
+export function summarizeQuizConfig(
+  cfg: DeepQuestionFormConfig,
+  translate?: (key: string) => string,
+): string {
+  const tr = translate ?? ((s: string) => s);
+  if (cfg.mode === "mimic") {
+    const target = cfg.paper_path.trim() || tr("no paper");
+    return [tr("Mimic Paper"), target, `${tr("Max")} ${cfg.max_questions}`].join(" · ");
+  }
+  return [
+    tr("Custom"),
+    `${cfg.num_questions} ${tr("questions")}`,
+    tr(titleCase(cfg.difficulty || "auto")),
+    tr(titleCase(cfg.question_type || "auto")),
+  ].join(" · ");
+}
+
 /**
  * Build the `config` payload to send over WebSocket for a quiz generation
  * request.

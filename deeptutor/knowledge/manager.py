@@ -15,9 +15,9 @@ import shutil
 import sys
 
 from deeptutor.logging import get_logger
-from deeptutor.services.rag.components.routing import FileTypeRouter
+from deeptutor.services.rag.file_routing import FileTypeRouter
 
-from deeptutor.services.rag.factory import DEFAULT_PROVIDER, LEGACY_PROVIDER_ALIASES, normalize_provider_name
+from deeptutor.services.rag.factory import DEFAULT_PROVIDER
 
 logger = get_logger("KnowledgeBaseManager")
 
@@ -67,6 +67,54 @@ def file_lock_exclusive(file_handle):
             fcntl.flock(file_handle.fileno(), fcntl.LOCK_UN)
 
 
+def _get_embedding_fingerprint() -> tuple[str, int] | None:
+    """Return ``(model_name, dimension)`` of the active embedding config."""
+    try:
+        from deeptutor.services.embedding import get_embedding_config
+
+        cfg = get_embedding_config()
+        return (cfg.model, cfg.dim)
+    except Exception:
+        return None
+
+
+def _reconcile_embedding_flags(knowledge_bases: dict) -> bool:
+    """Flag KBs whose stored embedding fingerprint differs from the active config.
+
+    Compares both model name and dimension.  Auto-clears the flag when the
+    user reverts to the original model.  Returns *True* when any entry changed.
+    """
+    fp = _get_embedding_fingerprint()
+    if not fp:
+        return False
+
+    current_model, current_dim = fp
+    changed = False
+
+    for kb_entry in knowledge_bases.values():
+        if not isinstance(kb_entry, dict):
+            continue
+        stored_model = kb_entry.get("embedding_model")
+        if not stored_model:
+            continue
+
+        stored_dim = kb_entry.get("embedding_dim")
+        mismatch = stored_model != current_model or (
+            stored_dim is not None and stored_dim != current_dim
+        )
+
+        if mismatch and not kb_entry.get("embedding_mismatch"):
+            kb_entry["embedding_mismatch"] = True
+            if not kb_entry.get("needs_reindex"):
+                kb_entry["needs_reindex"] = True
+            changed = True
+        elif not mismatch and kb_entry.get("embedding_mismatch"):
+            del kb_entry["embedding_mismatch"]
+            changed = True
+
+    return changed
+
+
 class KnowledgeBaseManager:
     """Manager for knowledge bases"""
 
@@ -109,14 +157,13 @@ class KnowledgeBaseManager:
                         continue
 
                     raw_provider = kb_entry.get("rag_provider")
-                    normalized_provider = normalize_provider_name(raw_provider or DEFAULT_PROVIDER)
-                    if kb_entry.get("rag_provider") != normalized_provider:
-                        kb_entry["rag_provider"] = normalized_provider
+                    if kb_entry.get("rag_provider") != DEFAULT_PROVIDER:
+                        kb_entry["rag_provider"] = DEFAULT_PROVIDER
                         config_changed = True
 
                     if (
                         isinstance(raw_provider, str)
-                        and raw_provider.strip().lower() in LEGACY_PROVIDER_ALIASES
+                        and raw_provider.strip().lower() not in {"", DEFAULT_PROVIDER}
                     ):
                         if not kb_entry.get("needs_reindex", False):
                             kb_entry["needs_reindex"] = True
@@ -131,6 +178,9 @@ class KnowledgeBaseManager:
                         if not kb_entry.get("needs_reindex", False):
                             kb_entry["needs_reindex"] = True
                             config_changed = True
+
+                if _reconcile_embedding_flags(knowledge_bases):
+                    config_changed = True
 
                 if config_changed:
                     try:
@@ -204,6 +254,11 @@ class KnowledgeBaseManager:
                 "message": "Ready",
                 "percent": 100,
             }
+
+        if status == "ready":
+            fp = _get_embedding_fingerprint()
+            if fp:
+                kb_config["embedding_model"], kb_config["embedding_dim"] = fp
 
         self._save_config()
 
@@ -292,8 +347,8 @@ class KnowledgeBaseManager:
                     kb_entry["description"] = metadata["description"]
                 if metadata.get("rag_provider"):
                     raw_provider = str(metadata["rag_provider"]).strip().lower()
-                    kb_entry["rag_provider"] = normalize_provider_name(raw_provider)
-                    if str(raw_provider).strip().lower() in LEGACY_PROVIDER_ALIASES:
+                    kb_entry["rag_provider"] = DEFAULT_PROVIDER
+                    if raw_provider not in {"", DEFAULT_PROVIDER}:
                         kb_entry["needs_reindex"] = True
                 if metadata.get("created_at"):
                     kb_entry["created_at"] = metadata["created_at"]
@@ -415,6 +470,18 @@ class KnowledgeBaseManager:
 
         return None
 
+    @staticmethod
+    def _embedding_fields(kb_config: dict) -> dict:
+        """Extract embedding fingerprint fields from a KB config entry."""
+        fields = {}
+        for key in ("embedding_model", "embedding_dim"):
+            val = kb_config.get(key)
+            if val is not None:
+                fields[key] = val
+        if kb_config.get("embedding_mismatch"):
+            fields["embedding_mismatch"] = True
+        return fields
+
     def get_metadata(self, name: str | None = None) -> dict:
         """Get knowledge base metadata.
         
@@ -436,11 +503,12 @@ class KnowledgeBaseManager:
             metadata = {
                 "name": kb_name,
                 "description": kb_config.get("description", f"Knowledge base: {kb_name}"),
-                "rag_provider": normalize_provider_name(kb_config.get("rag_provider")),
+                "rag_provider": DEFAULT_PROVIDER,
                 "needs_reindex": bool(kb_config.get("needs_reindex", False)),
                 "created_at": kb_config.get("created_at"),
                 "last_updated": kb_config.get("updated_at"),
             }
+            metadata.update(self._embedding_fields(kb_config))
             # Remove None values
             metadata = {k: v for k, v in metadata.items() if v is not None}
             return metadata
@@ -471,7 +539,7 @@ class KnowledgeBaseManager:
         status = kb_config.get("status")
         progress = kb_config.get("progress")
         description = kb_config.get("description", f"Knowledge base: {kb_name}")
-        rag_provider = normalize_provider_name(kb_config.get("rag_provider"))
+        rag_provider = DEFAULT_PROVIDER
         needs_reindex = bool(kb_config.get("needs_reindex", False))
         created_at = kb_config.get("created_at")
         updated_at = kb_config.get("updated_at")
@@ -506,7 +574,9 @@ class KnowledgeBaseManager:
             metadata["created_at"] = created_at
         if updated_at:
             metadata["last_updated"] = updated_at
-        
+
+        metadata.update(self._embedding_fields(kb_config))
+
         # Remove None values
         metadata = {k: v for k, v in metadata.items() if v is not None}
 
@@ -587,7 +657,11 @@ class KnowledgeBaseManager:
         if name not in self.list_knowledge_bases():
             raise ValueError(f"Knowledge base not found: {name}")
 
-        kb_dir = self.get_knowledge_base_path(name)
+        # Resolve the directory directly to stay idempotent: if the on-disk
+        # folder was already removed (e.g. manually rm-rf'd) we still want to
+        # purge the orphaned entry from kb_config.json instead of failing.
+        kb_dir = self.base_dir / name
+        dir_exists = kb_dir.exists()
 
         if not confirm:
             # Ask for confirmation in CLI
@@ -598,8 +672,19 @@ class KnowledgeBaseManager:
                 print("Deletion cancelled.")
                 return False
 
-        # Delete the directory
-        shutil.rmtree(kb_dir)
+        if dir_exists:
+            try:
+                shutil.rmtree(kb_dir)
+            except FileNotFoundError:
+                # Race: someone else deleted it between exists() and rmtree.
+                pass
+            except OSError as e:
+                logger.error(f"Failed to remove KB directory '{kb_dir}': {e}")
+                raise
+        else:
+            logger.warning(
+                f"KB directory '{kb_dir}' missing on disk; cleaning up orphaned config entry."
+            )
 
         # Remove from config
         if name in self.config.get("knowledge_bases", {}):
@@ -607,8 +692,8 @@ class KnowledgeBaseManager:
 
         # Update default if this was the default
         if self.config.get("default") == name:
-            remaining = self.list_knowledge_bases()
-            self.config["default"] = remaining[0] if remaining else None
+            remaining = [n for n in self.config.get("knowledge_bases", {}).keys() if n != name]
+            self.config["default"] = sorted(remaining)[0] if remaining else None
 
         self._save_config()
         return True
@@ -677,13 +762,7 @@ class KnowledgeBaseManager:
         if not folder.is_dir():
             raise ValueError(f"Path is not a directory: {folder}")
 
-        # Get RAG provider from kb_config.json to determine supported extensions
-        self.config = self._load_config()
-        kb_config = self.config.get("knowledge_bases", {}).get(kb_name, {})
-        provider = normalize_provider_name(kb_config.get("rag_provider") or DEFAULT_PROVIDER)
-
-        # Get supported files in folder based on provider
-        supported_extensions = FileTypeRouter.get_extensions_for_provider(provider)
+        supported_extensions = FileTypeRouter.get_supported_extensions()
         files: list[Path] = []
         for ext in supported_extensions:
             files.extend(folder.glob(f"**/*{ext}"))
@@ -814,7 +893,7 @@ class KnowledgeBaseManager:
         if not folder.exists() or not folder.is_dir():
             return []
 
-        supported_extensions = FileTypeRouter.get_extensions_for_provider(provider)
+        supported_extensions = FileTypeRouter.get_supported_extensions()
         files = []
 
         for ext in supported_extensions:
@@ -859,13 +938,7 @@ class KnowledgeBaseManager:
             except Exception:
                 pass
 
-        # Get RAG provider from kb_config.json to determine supported extensions
-        self.config = self._load_config()
-        kb_config = self.config.get("knowledge_bases", {}).get(kb_name, {})
-        provider = normalize_provider_name(kb_config.get("rag_provider") or DEFAULT_PROVIDER)
-
-        # Scan current files based on provider's supported extensions
-        supported_extensions = FileTypeRouter.get_extensions_for_provider(provider)
+        supported_extensions = FileTypeRouter.get_supported_extensions()
         new_files = []
         modified_files = []
 

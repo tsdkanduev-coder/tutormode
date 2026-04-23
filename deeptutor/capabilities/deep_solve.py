@@ -9,11 +9,27 @@ Wraps the existing ``MainSolver``.
 from __future__ import annotations
 
 import asyncio
+from typing import Any
+
 from deeptutor.capabilities.request_contracts import get_capability_request_schema
 from deeptutor.core.capability_protocol import BaseCapability, CapabilityManifest
 from deeptutor.core.context import UnifiedContext
 from deeptutor.core.stream_bus import StreamBus
 from deeptutor.core.trace import derive_trace_metadata, merge_trace_metadata
+
+
+def _first_image_url(attachments: list[Any]) -> str | None:
+    """Extract a data-URI or URL from the first image attachment, if any."""
+    for att in attachments or []:
+        if getattr(att, "type", "") != "image":
+            continue
+        if getattr(att, "url", ""):
+            return att.url
+        b64 = getattr(att, "base64", "")
+        if b64:
+            mime = getattr(att, "mime_type", "") or "image/png"
+            return f"data:{mime};base64,{b64}"
+    return None
 
 
 class DeepSolveCapability(BaseCapability):
@@ -28,11 +44,17 @@ class DeepSolveCapability(BaseCapability):
 
     async def run(self, context: UnifiedContext, stream: StreamBus) -> None:
         from deeptutor.agents.solve.main_solver import MainSolver
+        from deeptutor.capabilities._answer_now import extract_answer_now_context
         from deeptutor.services.llm.config import get_llm_config
+
+        answer_now_payload = extract_answer_now_context(context)
+        if answer_now_payload is not None:
+            await self._run_answer_now(context, stream, answer_now_payload)
+            return
 
         llm_config = get_llm_config()
         detailed = context.config_overrides.get("detailed_answer", True)
-        enabled_tools = (
+        enabled_tools = list(
             self.manifest.tools_used
             if context.enabled_tools is None
             else context.enabled_tools
@@ -44,13 +66,29 @@ class DeepSolveCapability(BaseCapability):
             else None
         )
 
+        # Consistency normalization: if rag is requested but no KB is
+        # actually available, strip "rag" from the enabled tool set so the
+        # ReAct loop never exposes an action that would fail at runtime.
+        if rag_enabled and not kb_name:
+            enabled_tools = [tool for tool in enabled_tools if tool != "rag"]
+            rag_enabled = False
+            await stream.progress(
+                message=(
+                    "RAG was enabled but no knowledge base is selected; "
+                    "the rag tool is disabled for this turn."
+                ),
+                source=self.name,
+                stage="planning",
+                metadata={"trace_kind": "warning", "reason": "rag_without_kb"},
+            )
+
         solver = MainSolver(
             api_key=llm_config.api_key,
             base_url=llm_config.base_url,
             api_version=llm_config.api_version,
             kb_name=kb_name,
             language=context.language,
-            enabled_tools=list(enabled_tools),
+            enabled_tools=enabled_tools,
             disable_planner_retrieve=not (rag_enabled and kb_name),
         )
         await solver.ainit()
@@ -242,8 +280,11 @@ class DeepSolveCapability(BaseCapability):
 
         solver._content_callback = _content_sink
 
+        image_url = _first_image_url(context.attachments)
+
         result = await solver.solve(
             question=context.user_message,
+            image_url=image_url,
             verbose=False,
             detailed=detailed,
             conversation_context=str(
@@ -262,6 +303,85 @@ class DeepSolveCapability(BaseCapability):
                 "response": final_answer,
                 "output_dir": result.get("output_dir", ""),
                 "metadata": result.get("metadata", {}),
+            },
+            source=self.name,
+        )
+
+    async def _run_answer_now(
+        self,
+        context: UnifiedContext,
+        stream: StreamBus,
+        payload: dict[str, Any],
+    ) -> None:
+        """
+        Fast-path for ``deep_solve``: skip Plan + ReAct, jump straight into
+        the writer with whatever reasoning trace has streamed so far.
+
+        The result payload preserves the same envelope shape as a normal
+        ``deep_solve`` turn (``response`` + ``metadata``) so the frontend
+        renders it identically.
+        """
+        from deeptutor.capabilities._answer_now import (
+            build_answer_now_trace_metadata,
+            format_trace_summary,
+            join_chunks,
+            labeled_block,
+            load_answer_now_prompts,
+            make_skip_notice,
+            stream_synthesis,
+        )
+
+        original = str(payload.get("original_user_message") or context.user_message).strip()
+        partial = str(payload.get("partial_response") or "").strip()
+        trace_summary = format_trace_summary(payload.get("events"), language=context.language)
+
+        prompts = load_answer_now_prompts("solve", context.language)
+        system_prompt = str(prompts.get("system", "")).strip()
+        user_prompt = str(prompts.get("user_template", "")).format(
+            original=original,
+            current_draft=labeled_block("Current Draft", partial),
+            execution_trace=labeled_block("Execution Trace", trace_summary),
+        )
+        notice_label = "Writing"
+
+        trace_meta = build_answer_now_trace_metadata(
+            capability=self.name, phase="writing", label="Answer now"
+        )
+
+        notice = make_skip_notice(
+            capability=self.name,
+            language=context.language,
+            stages_skipped=["planning", "reasoning"],
+        )
+
+        async with stream.stage("writing", source=self.name, metadata=trace_meta):
+            if notice:
+                await stream.content(
+                    notice + "\n\n",
+                    source=self.name,
+                    stage="writing",
+                )
+            chunks: list[str] = []
+            async for chunk in stream_synthesis(
+                stream=stream,
+                source=self.name,
+                stage="writing",
+                trace_meta=trace_meta,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=2000,
+            ):
+                chunks.append(chunk)
+
+        final_answer = join_chunks(chunks)
+        await stream.result(
+            {
+                "response": (notice + "\n\n" + final_answer).strip() if notice else final_answer,
+                "output_dir": "",
+                "metadata": {
+                    "answer_now": True,
+                    "synthesizer": notice_label,
+                },
             },
             source=self.name,
         )

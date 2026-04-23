@@ -15,7 +15,15 @@ from deeptutor.agents.research.request_config import (
     validate_research_request_config,
 )
 
-_RUNTIME_ONLY_KEYS = {"_persist_user_message", "followup_question_context"}
+_RUNTIME_ONLY_KEYS = {
+    "_persist_user_message",
+    "followup_question_context",
+    # "answer_now" is a universal escape hatch: the orchestrator re-routes
+    # any capability to chat when this is present. It is never declared on
+    # any per-capability ``RequestConfig`` schema, so we strip it before
+    # pydantic validation and re-attach it on the runtime-only side.
+    "answer_now_context",
+}
 
 
 class ChatRequestConfig(BaseModel):
@@ -39,6 +47,12 @@ class DeepQuestionRequestConfig(BaseModel):
     preference: str = ""
     paper_path: str = ""
     max_questions: int = Field(default=10, ge=1, le=100)
+
+
+class VisualizeRequestConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    render_mode: Literal["auto", "svg", "chartjs", "mermaid", "html"] = "auto"
 
 
 def _clean_public_config(raw_config: dict[str, Any] | None) -> dict[str, Any]:
@@ -85,6 +99,12 @@ def validate_deep_question_request_config(
     return _validate_model(DeepQuestionRequestConfig, raw_config, label="deep question")
 
 
+def validate_visualize_request_config(
+    raw_config: dict[str, Any] | None,
+) -> VisualizeRequestConfig:
+    return _validate_model(VisualizeRequestConfig, raw_config, label="visualize")
+
+
 def build_request_schema(model_type: type[BaseModel]) -> dict[str, Any]:
     return model_type.model_json_schema(mode="validation")
 
@@ -95,6 +115,7 @@ CAPABILITY_CONFIG_VALIDATORS: dict[str, Callable[[dict[str, Any] | None], Any]] 
     "deep_question": validate_deep_question_request_config,
     "deep_research": validate_research_request_config,
     "math_animator": validate_math_animator_request_config,
+    "visualize": validate_visualize_request_config,
 }
 
 CAPABILITY_REQUEST_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -103,6 +124,7 @@ CAPABILITY_REQUEST_SCHEMAS: dict[str, dict[str, Any]] = {
     "deep_question": build_request_schema(DeepQuestionRequestConfig),
     "deep_research": build_request_schema(DeepResearchRequestConfig),
     "math_animator": build_request_schema(MathAnimatorRequestConfig),
+    "visualize": build_request_schema(VisualizeRequestConfig),
 }
 
 
@@ -126,10 +148,12 @@ __all__ = [
     "ChatRequestConfig",
     "DeepQuestionRequestConfig",
     "DeepSolveRequestConfig",
+    "VisualizeRequestConfig",
     "build_request_schema",
     "get_capability_request_schema",
     "validate_capability_config",
     "validate_chat_request_config",
     "validate_deep_question_request_config",
     "validate_deep_solve_request_config",
+    "validate_visualize_request_config",
 ]

@@ -18,7 +18,7 @@ from deeptutor.services.config import (
 )
 
 from .base import SEARCH_API_KEY_ENV, BaseSearchProvider
-from .consolidation import CONSOLIDATION_TYPES, PROVIDER_TEMPLATES, AnswerConsolidator
+from .consolidation import PROVIDER_TEMPLATES, AnswerConsolidator
 from .providers import (
     _DEPRECATED_UNSUPPORTED,
     get_available_providers,
@@ -72,7 +72,7 @@ def _assert_provider_supported(provider_name: str) -> None:
     if provider_name in _DEPRECATED_UNSUPPORTED:
         raise ValueError(
             f"Search provider `{provider_name}` is deprecated/unsupported. "
-            "Please switch to brave, tavily, jina, searxng, duckduckgo, or perplexity."
+            "Please switch to brave, tavily, jina, searxng, duckduckgo, perplexity, or serper."
         )
     if provider_name not in SUPPORTED_SEARCH_PROVIDERS:
         allowed = ", ".join(sorted(SUPPORTED_SEARCH_PROVIDERS))
@@ -84,12 +84,16 @@ def web_search(
     output_dir: str | None = None,
     verbose: bool = False,
     provider: str | None = None,
-    consolidation: str | None = None,
     consolidation_custom_template: str | None = None,
     consolidation_llm_model: str | None = None,
     **provider_kwargs: Any,
 ) -> dict[str, Any]:
-    """Execute web search and return DeepTutor structured response shape."""
+    """Execute web search and return DeepTutor structured response shape.
+
+    Consolidation is automatic for providers that return raw SERP results
+    (``supports_answer=False``).  Pass ``consolidation_llm_model`` to
+    upgrade from template formatting to LLM synthesis.
+    """
     config = _get_web_search_config()
     if not config.get("enabled", True):
         _logger.warning("Web search is disabled in config")
@@ -113,10 +117,11 @@ def web_search(
             provider_name = "duckduckgo"
         else:
             provider_kwargs.setdefault("api_key", api_key)
-    elif provider_name == "perplexity":
+    elif provider_name in {"perplexity", "serper"}:
         api_key = _resolve_provider_key(provider_name, resolved.api_key)
         if not api_key:
-            raise ValueError("perplexity requires api_key (profile.api_key or PERPLEXITY_API_KEY).")
+            env_hint = "PERPLEXITY_API_KEY" if provider_name == "perplexity" else "SERPER_API_KEY"
+            raise ValueError(f"{provider_name} requires api_key (profile.api_key or {env_hint}).")
         provider_kwargs.setdefault("api_key", api_key)
     elif provider_name == "searxng":
         base_url = provider_kwargs.get("base_url") or resolved.base_url
@@ -138,19 +143,16 @@ def web_search(
         _logger.error(f"[{search_provider.name}] Search failed: {exc}")
         raise Exception(f"{search_provider.name} search failed: {exc}") from exc
 
-    # Compatibility layer: only apply optional consolidation when requested.
-    if consolidation is None:
-        consolidation = config.get("consolidation")
-    if consolidation_custom_template is None:
-        consolidation_custom_template = config.get("consolidation_template") or None
-    if consolidation and not search_provider.supports_answer:
-        llm_config = {}
-        if consolidation_llm_model:
-            llm_config["model"] = consolidation_llm_model
+    # Auto-consolidate for providers that don't generate their own answers.
+    if not search_provider.supports_answer:
+        if consolidation_custom_template is None:
+            consolidation_custom_template = config.get("consolidation_template") or None
+        use_llm = bool(consolidation_llm_model)
+        llm_config = {"model": consolidation_llm_model} if consolidation_llm_model else None
         consolidator = AnswerConsolidator(
-            consolidation_type=consolidation,
+            use_llm=use_llm,
             custom_template=consolidation_custom_template,
-            llm_config=llm_config if llm_config else None,
+            llm_config=llm_config,
         )
         response = consolidator.consolidate(response)
 
@@ -184,9 +186,7 @@ def get_current_config() -> dict[str, Any]:
         "providers": get_providers_info(),
         "supported_providers": sorted(SUPPORTED_SEARCH_PROVIDERS),
         "deprecated_providers": sorted(DEPRECATED_SEARCH_PROVIDERS),
-        "consolidation": config.get("consolidation"),
         "consolidation_template": config.get("consolidation_template") or None,
-        "consolidation_types": CONSOLIDATION_TYPES,
         "template_providers": list(PROVIDER_TEMPLATES.keys()),
     }
 
@@ -205,7 +205,6 @@ __all__ = [
     "Citation",
     "SearchResult",
     "AnswerConsolidator",
-    "CONSOLIDATION_TYPES",
     "PROVIDER_TEMPLATES",
     "BaseSearchProvider",
     "SearchProvider",

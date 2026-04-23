@@ -9,7 +9,9 @@ import { setTheme, type Theme } from "./theme";
  * Toggle theme between light and dark
  */
 export function toggleTheme(currentTheme: Theme): Theme {
-  const newTheme = currentTheme === "light" ? "dark" : "light";
+  const order: Theme[] = ["snow", "light", "dark", "glass"];
+  const idx = order.indexOf(currentTheme);
+  const newTheme = order[(idx + 1) % order.length];
   setTheme(newTheme);
   return newTheme;
 }
@@ -32,7 +34,10 @@ export function setDarkTheme(): void {
  * Get CSS class for theme-aware styling
  */
 export function getThemeClass(theme: Theme): string {
-  return theme === "dark" ? "dark" : "";
+  if (theme === "dark") return "dark";
+  if (theme === "glass") return "dark theme-glass";
+  if (theme === "snow") return "theme-snow";
+  return "";
 }
 
 /**
@@ -58,7 +63,7 @@ export function onThemeChange(callback: (theme: Theme) => void): () => void {
   const handleStorageChange = (e: StorageEvent) => {
     if (
       e.key === "deeptutor-theme" &&
-      (e.newValue === "light" || e.newValue === "dark")
+      (e.newValue === "light" || e.newValue === "dark" || e.newValue === "glass" || e.newValue === "snow")
     ) {
       callback(e.newValue);
     }

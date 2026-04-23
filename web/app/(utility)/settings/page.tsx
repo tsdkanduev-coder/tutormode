@@ -9,6 +9,8 @@ import {
   ChevronDown,
   ChevronRight,
   Database,
+  Eye,
+  EyeOff,
   Loader2,
   Plus,
   Rocket,
@@ -23,7 +25,7 @@ import {
 
 import { useTranslation } from "react-i18next";
 
-import { writeStoredLanguage } from "@/context/AppShellContext";
+import { writeStoredLanguage } from "@/context/app-shell-storage";
 import { apiUrl } from "@/lib/api";
 import { setTheme as applyThemePreference } from "@/lib/theme";
 
@@ -66,11 +68,11 @@ type Catalog = {
 };
 
 type UiSettings = {
-  theme: "light" | "dark";
+  theme: "light" | "dark" | "glass" | "snow";
   language: "en" | "zh";
 };
 
-type ProviderOption = { value: string; label: string; base_url?: string };
+type ProviderOption = { value: string; label: string; base_url?: string; default_dim?: string };
 
 type SettingsPayload = {
   ui: UiSettings;
@@ -367,7 +369,7 @@ function SettingsPageContent() {
   const isTourMode = searchParams.get("tour") === "true";
 
   const [status, setStatus] = useState<SystemStatus | null>(null);
-  const [theme, setTheme] = useState<"light" | "dark">("light");
+  const [theme, setTheme] = useState<"light" | "dark" | "glass" | "snow">("light");
   const [language, setLanguage] = useState<"en" | "zh">("en");
   const [catalog, setCatalog] = useState<Catalog>(defaultCatalog());
   const [draft, setDraft] = useState<Catalog>(defaultCatalog());
@@ -376,6 +378,7 @@ function SettingsPageContent() {
   const [testRunning, setTestRunning] = useState<ServiceName | null>(null);
   const [saving, setSaving] = useState(false);
   const [applying, setApplying] = useState(false);
+  const [showApiKey, setShowApiKey] = useState(false);
   const [toast, setToast] = useState<string>("");
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [providers, setProviders] = useState<Record<ServiceName, ProviderOption[]>>({ llm: [], embedding: [], search: [] });
@@ -458,9 +461,13 @@ function SettingsPageContent() {
     searchProviderRaw === "perplexity" &&
     !String(activeProfile?.api_key || "").trim();
 
+  useEffect(() => {
+    setShowApiKey(false);
+  }, [activeService, activeProfile?.id]);
+
   // -- UI preference helpers ----------------------------------------------
 
-  const persistUi = async (nextTheme: "light" | "dark", nextLanguage: "en" | "zh") => {
+  const persistUi = async (nextTheme: "light" | "dark" | "glass" | "snow", nextLanguage: "en" | "zh") => {
     await fetch(apiUrl("/api/v1/settings/ui"), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -468,7 +475,7 @@ function SettingsPageContent() {
     });
   };
 
-  const updateTheme = async (nextTheme: "light" | "dark") => {
+  const updateTheme = async (nextTheme: "light" | "dark" | "glass" | "snow") => {
     setTheme(nextTheme);
     applyThemePreference(nextTheme);
     await persistUi(nextTheme, language);
@@ -488,6 +495,11 @@ function SettingsPageContent() {
       mutator(next);
       return next;
     });
+  };
+
+  const embeddingDefaultDim = (binding?: string) => {
+    const match = (providers.embedding || []).find((p) => p.value === (binding || "openai"));
+    return match?.default_dim || "3072";
   };
 
   const addProfile = () => {
@@ -512,7 +524,7 @@ function SettingsPageContent() {
           id: modelId,
           name: "New Model",
           model: "",
-          ...(activeService === "embedding" ? { dimension: "3072" } : {}),
+          ...(activeService === "embedding" ? { dimension: embeddingDefaultDim() } : {}),
         });
         service.active_model_id = modelId;
       }
@@ -543,7 +555,7 @@ function SettingsPageContent() {
         id: modelId,
         name: "New Model",
         model: "",
-        ...(activeService === "embedding" ? { dimension: "3072" } : {}),
+        ...(activeService === "embedding" ? { dimension: embeddingDefaultDim(profile.binding) } : {}),
       });
       service.active_model_id = modelId;
     });
@@ -861,7 +873,7 @@ function SettingsPageContent() {
           <div className="flex items-center gap-2">
             <span className="text-[12px] text-[var(--muted-foreground)]">{t("Theme")}</span>
             <div className="flex gap-0.5 rounded-lg bg-[var(--muted)] p-0.5">
-              {(["light", "dark"] as const).map((v) => (
+              {(["snow", "light", "dark", "glass"] as const).map((v) => (
                 <button
                   key={v}
                   onClick={() => updateTheme(v)}
@@ -871,7 +883,7 @@ function SettingsPageContent() {
                       : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
                   }`}
                 >
-                  {v === "light" ? t("Light") : t("Dark")}
+                  {v === "snow" ? t("Snow") : v === "light" ? t("Light") : v === "dark" ? t("Dark") : t("Glass")}
                 </button>
               ))}
             </div>
@@ -890,7 +902,7 @@ function SettingsPageContent() {
                       : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
                   }`}
                 >
-                  {v === "en" ? "English" : "中文"}
+                  {v === "en" ? t("language.english") : t("language.chinese")}
                 </button>
               ))}
             </div>
@@ -1030,8 +1042,11 @@ function SettingsPageContent() {
                             const field = activeService === "search" ? "provider" : "binding";
                             updateProfileField(field, val);
                             const match = (providers[activeService] || []).find((p) => p.value === val);
-                            if (match?.base_url && !activeProfile.base_url) {
+                            if (match?.base_url) {
                               updateProfileField("base_url", match.base_url);
+                            }
+                            if (activeService === "embedding" && match?.default_dim) {
+                              updateModelField("dimension", match.default_dim);
                             }
                           }}
                         >
@@ -1073,12 +1088,26 @@ function SettingsPageContent() {
                     </div>
                     <div className="sm:col-span-2">
                       <div className="mb-1.5 text-[12px] text-[var(--muted-foreground)]">{t("API Key")}</div>
-                      <input
-                        className={inputClass}
-                        value={activeProfile.api_key}
-                        onChange={(e) => updateProfileField("api_key", e.target.value)}
-                        placeholder="sk-..."
-                      />
+                      <div className="relative">
+                        <input
+                          type={showApiKey ? "text" : "password"}
+                          autoComplete="new-password"
+                          spellCheck={false}
+                          className={`${inputClass} pr-10 font-mono`}
+                          value={activeProfile.api_key}
+                          onChange={(e) => updateProfileField("api_key", e.target.value)}
+                          placeholder="sk-..."
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowApiKey((prev) => !prev)}
+                          className="absolute right-1 top-1/2 -translate-y-1/2 rounded-md p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
+                          aria-label={showApiKey ? t("Hide API key") : t("Show API key")}
+                          title={showApiKey ? t("Hide API key") : t("Show API key")}
+                        >
+                          {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                        </button>
+                      </div>
                     </div>
                     <div>
                       <div className="mb-1.5 text-[12px] text-[var(--muted-foreground)]">{t("API Version")}</div>
@@ -1162,7 +1191,7 @@ function SettingsPageContent() {
                         {activeService === "embedding" && (
                           <div>
                             <div className="mb-1.5 text-[12px] text-[var(--muted-foreground)]">{t("Dimension")}</div>
-                            <input className={inputClass} value={activeModel.dimension || "3072"} onChange={(e) => updateModelField("dimension", e.target.value)} />
+                            <input className={inputClass} value={activeModel.dimension || embeddingDefaultDim(activeProfile?.binding)} onChange={(e) => updateModelField("dimension", e.target.value)} />
                           </div>
                         )}
                       </div>

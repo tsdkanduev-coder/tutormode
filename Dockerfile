@@ -15,18 +15,29 @@
 # ============================================
 # Stage 1: Frontend Builder
 # ============================================
-FROM node:22-slim AS frontend-builder
+# Run on the build platform natively (not under QEMU emulation).
+# The output is platform-independent static assets (JS/HTML/CSS),
+# so there is no need to cross-compile this stage.
+FROM --platform=$BUILDPLATFORM node:22-slim AS frontend-builder
 
 WORKDIR /app/web
 
 # Accept build argument for backend port
 ARG BACKEND_PORT=8001
 
+# Application version (e.g. "v1.2.3"). Passed by CI from the release tag
+# and inlined into the Next.js bundle via NEXT_PUBLIC_APP_VERSION so the
+# sidebar version badge can compare it with the latest GitHub release.
+ARG APP_VERSION=""
+ENV APP_VERSION=$APP_VERSION
+
 # Copy package files first for better caching
 COPY web/package.json web/package-lock.json* ./
 
-# Install dependencies
-RUN npm ci --legacy-peer-deps
+# Install dependencies with generous timeout for CI environments
+RUN npm config set fetch-timeout 600000 && \
+    npm config set fetch-retries 5 && \
+    npm ci --legacy-peer-deps
 
 # Copy frontend source code
 COPY web/ ./
@@ -38,6 +49,14 @@ RUN echo "NEXT_PUBLIC_API_BASE=__NEXT_PUBLIC_API_BASE_PLACEHOLDER__" > .env.loca
 # Build Next.js for production with standalone output
 # This allows runtime environment variable injection
 RUN npm run build
+
+# ============================================
+# Stage 1b: Node Runtime for Target Platform
+# ============================================
+# Provides the correctly-architected node binary for the final image.
+# Unlike frontend-builder (pinned to BUILDPLATFORM), this stage pulls
+# the node image matching each target platform (amd64 / arm64).
+FROM node:22-slim AS node-runtime
 
 # ============================================
 # Stage 2: Python Base with Dependencies
@@ -126,9 +145,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy Node.js from frontend-builder stage (avoids re-downloading from NodeSource)
-COPY --from=frontend-builder /usr/local/bin/node /usr/local/bin/node
-COPY --from=frontend-builder /usr/local/lib/node_modules /usr/local/lib/node_modules
+# Copy Node.js from node-runtime stage (platform-matched binary)
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
     && node --version && npm --version
@@ -160,7 +179,6 @@ RUN mkdir -p \
     data/user/workspace/notebook \
     data/user/workspace/co-writer/audio \
     data/user/workspace/co-writer/tool_calls \
-    data/user/workspace/guide \
     data/user/workspace/chat/chat \
     data/user/workspace/chat/deep_solve \
     data/user/workspace/chat/deep_question \

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-
 from deeptutor.capabilities.request_contracts import get_capability_request_schema
 from deeptutor.core.capability_protocol import BaseCapability, CapabilityManifest
 from deeptutor.core.context import UnifiedContext
@@ -34,8 +33,14 @@ class DeepResearchCapability(BaseCapability):
             build_research_runtime_config,
             validate_research_request_config,
         )
+        from deeptutor.capabilities._answer_now import extract_answer_now_context
         from deeptutor.services.config import load_config_with_main
         from deeptutor.services.llm.config import get_llm_config
+
+        answer_now_payload = extract_answer_now_context(context)
+        if answer_now_payload is not None:
+            await self._run_answer_now(context, stream, answer_now_payload)
+            return
 
         llm_config = get_llm_config()
         kb_name = context.knowledge_bases[0] if context.knowledge_bases else None
@@ -46,6 +51,37 @@ class DeepResearchCapability(BaseCapability):
             else context.enabled_tools
         )
         request_config = validate_research_request_config(context.config_overrides)
+
+        # Consistency normalization: if "kb" is selected as a research source
+        # but no knowledge base is actually attached, drop "kb" from the
+        # effective sources. This avoids any code path falling through to a
+        # placeholder KB at the pipeline layer. If after the downgrade no
+        # source is left at all, surface a clear error to the user.
+        if "kb" in request_config.sources and not kb_name:
+            request_config = request_config.model_copy(
+                update={
+                    "sources": [src for src in request_config.sources if src != "kb"],
+                }
+            )
+            await stream.progress(
+                message=(
+                    "Knowledge base source was selected, but no knowledge "
+                    "base is attached; KB retrieval is disabled for this "
+                    "research run."
+                ),
+                source=self.name,
+                stage="rephrasing",
+                metadata={"trace_kind": "warning", "reason": "kb_without_kb_name"},
+            )
+            if not request_config.sources:
+                await stream.error(
+                    "Deep research requires at least one source. Please "
+                    "either attach a knowledge base or enable web/papers "
+                    "sources.",
+                    source=self.name,
+                )
+                return
+
         config = build_research_runtime_config(
             base_config=load_config_with_main("main.yaml"),
             request_config=request_config,
@@ -343,6 +379,73 @@ class DeepResearchCapability(BaseCapability):
 
         await stream.result(
             {"response": report, "metadata": result.get("metadata", {})},
+            source=self.name,
+        )
+
+    async def _run_answer_now(
+        self,
+        context: UnifiedContext,
+        stream: StreamBus,
+        payload: dict[str, Any],
+    ) -> None:
+        """
+        Fast-path for ``deep_research``: skip the rephrase/decompose/research
+        loop and synthesize the report directly from whatever evidence the
+        partial trace already contains.
+        """
+        from deeptutor.capabilities._answer_now import (
+            build_answer_now_trace_metadata,
+            format_trace_summary,
+            join_chunks,
+            labeled_block,
+            load_answer_now_prompts,
+            make_skip_notice,
+            stream_synthesis,
+        )
+
+        original = str(payload.get("original_user_message") or context.user_message).strip()
+        partial = str(payload.get("partial_response") or "").strip()
+        trace_summary = format_trace_summary(payload.get("events"), language=context.language)
+
+        prompts = load_answer_now_prompts("research", context.language)
+        system_prompt = str(prompts.get("system", "")).strip()
+        user_prompt = str(prompts.get("user_template", "")).format(
+            original=original,
+            current_draft=labeled_block("Current Draft", partial),
+            research_trace=labeled_block("Research Trace", trace_summary),
+        )
+
+        trace_meta = build_answer_now_trace_metadata(
+            capability=self.name, phase="reporting", label="Answer now"
+        )
+        notice = make_skip_notice(
+            capability=self.name,
+            language=context.language,
+            stages_skipped=["rephrasing", "decomposing", "researching"],
+        )
+
+        async with stream.stage("reporting", source=self.name, metadata=trace_meta):
+            if notice:
+                await stream.content(notice + "\n\n", source=self.name, stage="reporting")
+            chunks: list[str] = []
+            async for chunk in stream_synthesis(
+                stream=stream,
+                source=self.name,
+                stage="reporting",
+                trace_meta=trace_meta,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=3200,
+            ):
+                chunks.append(chunk)
+
+        report = join_chunks(chunks)
+        full = (notice + "\n\n" + report).strip() if notice else report
+        await stream.result(
+            {
+                "response": full,
+                "metadata": {"answer_now": True},
+            },
             source=self.name,
         )
 

@@ -10,7 +10,8 @@ data/
 run_code_workspace/
 deeptutor/agents/question/reference_papers/
 deeptutor/services/rag/eg_only_for_analysis/
-DeepTutor_arxiv-4/
+docs/
+.github
 
 # LaTeX build artifacts
 *.aux
@@ -74,6 +75,9 @@ node_modules/
 web/.next/
 out/
 web/out/
+
+# Auto-generated env.local (created by start_web.py / start_tour.py)
+web/.env.local
 
 # Frontend build artifacts
 dist/

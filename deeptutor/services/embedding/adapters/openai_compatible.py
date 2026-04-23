@@ -26,6 +26,7 @@ class OpenAICompatibleEmbeddingAdapter(BaseEmbeddingAdapter):
         Supported shapes include:
         - {"data": [{"embedding": [...]}, ...]}
         - {"embeddings": [[...], ...]}
+        - {"embedding": [...]}  (Ollama /api/embeddings)
         - {"result": {"data": [{"embedding": [...]}, ...]}}
         - {"output": {"embeddings": [[...], ...]}}
         """
@@ -57,6 +58,13 @@ class OpenAICompatibleEmbeddingAdapter(BaseEmbeddingAdapter):
         # Common proxy schema
         if isinstance(data.get("embeddings"), list):
             candidates.append(data["embeddings"])
+        # Ollama /api/embeddings returns singular "embedding" as a flat vector
+        if isinstance(data.get("embedding"), list):
+            emb = data["embedding"]
+            if emb and isinstance(emb[0], (int, float)):
+                candidates.append([emb])
+            else:
+                candidates.append(emb)
         # Nested result/output variants
         result = data.get("result")
         if isinstance(result, dict):
@@ -77,7 +85,10 @@ class OpenAICompatibleEmbeddingAdapter(BaseEmbeddingAdapter):
             first = c[0]
             # list of {"embedding":[...]}
             if isinstance(first, dict) and "embedding" in first:
-                return [item.get("embedding", []) for item in c if isinstance(item, dict)]
+                return [
+                    item.get("embedding") or []
+                    for item in c if isinstance(item, dict)
+                ]
             # list of vectors [[...], ...]
             if isinstance(first, list):
                 return [item for item in c if isinstance(item, list)]
@@ -85,11 +96,12 @@ class OpenAICompatibleEmbeddingAdapter(BaseEmbeddingAdapter):
         keys = sorted(list(data.keys()))
         raise ValueError(
             "Cannot parse embeddings from response JSON. "
-            f"Top-level keys={keys}, expected one of: data/embeddings/result/output."
+            f"Top-level keys={keys}, expected one of: data/embedding/embeddings/result/output."
         )
 
-    _MAX_RETRIES = 2
+    _MAX_RETRIES = 5
     _RETRY_BACKOFF = 1.0
+    _RATE_LIMIT_BACKOFF = 5.0
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         import asyncio
@@ -136,26 +148,48 @@ class OpenAICompatibleEmbeddingAdapter(BaseEmbeddingAdapter):
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     response = await client.post(url, json=payload, headers=headers)
 
+                    # Handle rate limiting (429) with retry
+                    if response.status_code == 429:
+                        retry_after = float(response.headers.get("Retry-After", 0))
+                        wait = max(retry_after, self._RATE_LIMIT_BACKOFF * (2 ** attempt))
+                        logger.warning(
+                            f"Rate limited (429) on attempt {attempt + 1}/{1 + self._MAX_RETRIES}, "
+                            f"retrying in {wait:.1f}s..."
+                        )
+                        await asyncio.sleep(wait)
+                        last_exc = Exception(f"HTTP 429 Too Many Requests")
+                        continue
+
                     if response.status_code >= 400:
                         logger.error(f"HTTP {response.status_code} response body: {response.text}")
 
                     response.raise_for_status()
                     data = response.json()
                 break
-            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            except httpx.TransportError as exc:
+                # httpx.TransportError covers all transient transport-layer
+                # failures: ConnectError, ReadError, WriteError, ConnectTimeout,
+                # ReadTimeout, WriteTimeout, PoolTimeout, RemoteProtocolError, etc.
+                # Retrying any of these with backoff is safe and obviates the
+                # need to keep extending an explicit allow-list.
                 last_exc = exc
                 if attempt < self._MAX_RETRIES:
-                    wait = self._RETRY_BACKOFF * (attempt + 1)
+                    wait = self._RETRY_BACKOFF * (2 ** attempt)
                     logger.warning(
-                        f"Embedding request timeout (attempt {attempt + 1}/{1 + self._MAX_RETRIES}), "
-                        f"retrying in {wait:.0f}s..."
+                        f"Embedding request transport error ({type(exc).__name__}: {exc}) "
+                        f"on attempt {attempt + 1}/{1 + self._MAX_RETRIES}, "
+                        f"retrying in {wait:.1f}s..."
                     )
                     await asyncio.sleep(wait)
                 else:
                     logger.error(
-                        f"Embedding request failed after {1 + self._MAX_RETRIES} attempts: {exc}"
+                        f"Embedding request failed after {1 + self._MAX_RETRIES} attempts "
+                        f"({type(exc).__name__}: {exc})"
                     )
                     raise
+        else:
+            if last_exc:
+                raise last_exc
 
         embeddings = self._extract_embeddings_from_response(data)
         if not embeddings:

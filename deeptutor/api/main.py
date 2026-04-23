@@ -1,9 +1,7 @@
-import logging
 from contextlib import asynccontextmanager
-from pathlib import Path
+import logging
 
-from fastapi import FastAPI
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -14,23 +12,17 @@ from deeptutor.services.path_service import get_path_service
 logger = get_logger("API")
 
 
-class _ProgressWsAccessFilter(logging.Filter):
-    """Suppress noisy uvicorn access logs for progress WebSocket endpoints.
+class _SuppressWsNoise(logging.Filter):
+    """Suppress noisy uvicorn logs for WebSocket connection churn."""
 
-    These endpoints are polled every few seconds by the frontend for every KB,
-    generating hundreds of ``connection open`` / ``connection closed`` lines
-    that drown out useful output.
-    """
-
-    _SUPPRESSED_FRAGMENTS = ("progress/ws", "connection open", "connection closed")
+    _SUPPRESSED = ("connection open", "connection closed")
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
-        return not any(f in msg for f in self._SUPPRESSED_FRAGMENTS)
+        return not any(f in msg for f in self._SUPPRESSED)
 
 
-for _uv_name in ("uvicorn.access", "uvicorn.error"):
-    logging.getLogger(_uv_name).addFilter(_ProgressWsAccessFilter())
+logging.getLogger("uvicorn.error").addFilter(_SuppressWsNoise())
 
 CONFIG_DRIFT_ERROR_TEMPLATE = (
     "Configuration Drift Detected: Capability tool references {drift} are not "
@@ -113,6 +105,7 @@ async def lifespan(app: FastAPI):
 
     try:
         from deeptutor.services.tutorbot import get_tutorbot_manager
+
         await get_tutorbot_manager().auto_start_bots()
     except Exception as e:
         logger.warning(f"Failed to auto-start TutorBots: {e}")
@@ -125,6 +118,7 @@ async def lifespan(app: FastAPI):
     # Stop TutorBots
     try:
         from deeptutor.services.tutorbot import get_tutorbot_manager
+
         await get_tutorbot_manager().stop_all()
         logger.info("TutorBots stopped")
     except Exception as e:
@@ -151,6 +145,25 @@ app = FastAPI(
     # See: https://github.com/HKUDS/DeepTutor/issues/112
     redirect_slashes=False,
 )
+
+# Log only non-200 requests (uvicorn access_log is disabled in run_server.py)
+_access_logger = logging.getLogger("uvicorn.access")
+
+
+@app.middleware("http")
+async def selective_access_log(request, call_next):
+    response = await call_next(request)
+    if response.status_code != 200:
+        _access_logger.info(
+            '%s - "%s %s HTTP/%s" %d',
+            request.client.host if request.client else "-",
+            request.method,
+            request.url.path,
+            request.scope.get("http_version", "1.1"),
+            response.status_code,
+        )
+    return response
+
 
 # Configure CORS
 app.add_middleware(
@@ -186,17 +199,19 @@ app.mount(
 # Some router modules load YAML settings at import time.
 from deeptutor.api.routers import (
     agent_config,
+    book,
     chat,
     co_writer,
     dashboard,
-    guide,
     knowledge,
     memory,
     notebook,
     plugins_api,
     question,
+    question_notebook,
     sessions,
     settings,
+    skills,
     solve,
     system,
     tutorbot,
@@ -212,10 +227,14 @@ app.include_router(knowledge.router, prefix="/api/v1/knowledge", tags=["knowledg
 app.include_router(dashboard.router, prefix="/api/v1/dashboard", tags=["dashboard"])
 app.include_router(co_writer.router, prefix="/api/v1/co_writer", tags=["co_writer"])
 app.include_router(notebook.router, prefix="/api/v1/notebook", tags=["notebook"])
-app.include_router(guide.router, prefix="/api/v1/guide", tags=["guide"])
+app.include_router(book.router, prefix="/api/v1/book", tags=["book"])
 app.include_router(memory.router, prefix="/api/v1/memory", tags=["memory"])
 app.include_router(sessions.router, prefix="/api/v1/sessions", tags=["sessions"])
+app.include_router(
+    question_notebook.router, prefix="/api/v1/question-notebook", tags=["question-notebook"]
+)
 app.include_router(settings.router, prefix="/api/v1/settings", tags=["settings"])
+app.include_router(skills.router, prefix="/api/v1/skills", tags=["skills"])
 app.include_router(system.router, prefix="/api/v1/system", tags=["system"])
 app.include_router(plugins_api.router, prefix="/api/v1/plugins", tags=["plugins"])
 app.include_router(agent_config.router, prefix="/api/v1/agent-config", tags=["agent-config"])
